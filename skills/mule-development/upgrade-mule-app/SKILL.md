@@ -150,7 +150,7 @@ If build fails, STOP and inform user the app must build on current version befor
 
 ## Step 7: Check Operations/Configs/Error Types Changes
 
-(To be implemented)
+See `references/plan-connector-upgrades.md` §2–§5 (Mode-A summary, usage enumeration, Mode-B per-op, Mode-C per-config-provider).
 
 - Describe connector operations for version changes
 - Identify changes to operations, configs, error types
@@ -199,7 +199,7 @@ If build fails, STOP and inform user the app must build on current version befor
 
 ## Step 12: Present Plan & Get Approval
 
-(To be implemented)
+See `references/plan-connector-upgrades.md` §7 (plan synthesis, approval gate) and §8 (Phase-C completeness checklist — run before user is asked to approve).
 
 - Display all version updates
 - Show connector version changes
@@ -234,7 +234,7 @@ If build fails, STOP and inform user the app must build on current version befor
 
 ## Step 15: Update Application Code
 
-(To be implemented)
+See `references/execute-connector-upgrades.md` §1–§3 (LLM flow-XML edits, DW updates, MUnit updates). Use `references/llm-prompts.md` verbatim as the model prompts.
 
 Update application code based on analysis from Phase 1:
 
@@ -250,7 +250,7 @@ Use metadata from `describe-connector` to ensure operations, configs, and attrib
 
 ## Step 16: Build Loop
 
-(To be implemented)
+See `references/execute-connector-upgrades.md` §4 (bounded 3-retry recovery loop). Note: `mvn clean package` BUILD SUCCESS is packaging-only — Step 17 (`mvn test`) is the real gate.
 
 - Run `mvn clean package -DskipTests`
 - If build fails, parse errors and fix remaining issues
@@ -291,7 +291,7 @@ Use metadata from `describe-connector` to ensure operations, configs, and attrib
 
 ## Step 20: Clean Up Workspace `tmp/`
 
-(To be implemented)
+See `references/execute-connector-upgrades.md` §6 — `rm -r tmp/` must run in a separate response from the build, per the discipline block at the top of this file.
 
 Remove temporary files created during upgrade:
 
