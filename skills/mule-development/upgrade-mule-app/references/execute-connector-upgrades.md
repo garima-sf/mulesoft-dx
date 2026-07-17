@@ -181,16 +181,43 @@ Save the raw output to `tmp/mvn-failures/<attempt>.log`.
 
 Do not attempt a fourth retry without user direction.
 
-### MUnit gate (informational)
+---
 
-After `mvn clean package` reports `BUILD SUCCESS`, classify what runtime validation is available on this fixture:
+## §4.5 MUnit Loop (Step 17)
+
+Runs AFTER §4 (Step 16) reports `BUILD SUCCESS`. `mvn clean package` validates packaging only — `mvn test` is authoritative runtime validation.
 
 ```bash
 grep -c 'munit-maven-plugin' pom.xml
 ```
 
-- `>= 1` → the fixture has MUnit wired. Run `mvn test` (or `mvn verify`) once as a second gate. If tests fail, feed the failure into the recovery loop the same way as an XSD failure — the per-op JSON in `tmp/connector-metadata/` almost always has the fix. If tests pass, the upgrade has runtime validation.
-- `0` → the fixture has no MUnit plugin declared. `BUILD SUCCESS` means "packaging succeeded" only. Log this in the completion note (`no runtime validation performed — fixture does not declare munit-maven-plugin`). Do NOT invent an MUnit suite; that is outside the skill's scope.
+- `0` → no MUnit plugin declared. `BUILD SUCCESS` means "packaging succeeded" only. Log this in the completion note (`no runtime validation performed — fixture does not declare munit-maven-plugin`) and skip the loop. Do NOT invent an MUnit suite; that is outside the skill's scope.
+- `>= 1` → MUnit is wired. Enter the loop below.
+
+### The loop
+
+**One `mvn test` per response.** On failure, use the same recovery classifier from §4 — but the applicable classes are narrower because MUnit failures are always inside test XML, not flow XML:
+
+1. **attribute-rename** on `<munit-tools:mock-when processor="<prefix:op>">` — an unknown mock attribute. Fix source: `tmp/connector-metadata/<nick>-new-<op>.json` `.attributes[].attributeName`.
+2. **element-rename** on `<munit-tools:mock-when processor="<prefix:oldOp>">` — the `processor` attribute names an op that no longer exists. Fix source: `tmp/connector-metadata/<nick>-new.json` `.operations[]`; apply the plan's rename mapping.
+3. **connection-provider element name** — same shape as element-rename, but inside a `<munit-tools:mock-when processor="<prefix:config>">` referring to a connection-provider element. Fix source: `tmp/connector-metadata/<nick>-new-<config>-<provider>.json` `.elementName`.
+4. **enum-value** on mocked payload — `<munit-tools:then-return>` returns a constant that's no longer a valid enum value. Fix source: per-op `.attributes[].allowedValues`.
+5. **assertion-shape** — `<munit-tools:assert-that>` reads a field the NEW op no longer emits. Fix source: cross-reference Mode-B `.output*` keys, rewrite the JSONPath / DW read.
+
+Save each failing run's output to `tmp/mvn-failures/munit-<attempt>.log`.
+
+### Retry budget: 5–6 attempts
+
+MUnit failures are more diffuse than XSD/DSL failures (test authoring style varies, and one op change often touches multiple mocks), so this loop uses a looser budget than §4's 3-retry cap.
+
+After the **6th** failed `mvn test`, HALT via `AskUserQuestion` with:
+
+- The last three `tmp/mvn-failures/munit-<attempt>.log` excerpts (first 30 lines each)
+- The classification picked for each
+- The edit applied on each attempt
+- 2–4 candidate next actions
+
+Do NOT attempt a 7th retry without user direction. `mvn test` passing is the runtime validation gate — treat repeated failures as a signal that the plan missed a Mode-B / Mode-C detail, not as noise to retry through.
 
 ---
 

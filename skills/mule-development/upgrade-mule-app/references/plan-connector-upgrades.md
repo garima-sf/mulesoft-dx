@@ -33,6 +33,33 @@ grep -E "NoSuchMethodError|doesn't support|ClassNotFoundException" /tmp/xlog.log
 
 ---
 
+## §1.5 Step 6 — Java-17-compatible connector version pick
+
+For each in-scope connector, resolve the latest Java-17-compatible version BEFORE Mode-A summary describe runs. This step uses `anypoint-cli-v4 exchange asset` metadata (not the CLI's `dx mule describe-connector` introspection) — Exchange tags carry a `is-java-17-supported` flag that lets us pick a pin without a runtime describe.
+
+**Search token:** the connector's `artifactId` verbatim, filtered by `--type Extension`.
+
+**Algorithm** (per connector; run in parallel, capped at 10 concurrent):
+
+1. `anypoint-cli-v4 exchange asset list <artifactId> --type Extension --output json` → filter to entries whose `assetId` matches exactly, sort versions semver-descending, keep top 5.
+2. Walk latest → oldest for at most 5 versions: `anypoint-cli-v4 exchange asset describe "<groupId>/<assetId>/<version>" --output json | jq '.tags[]? | select(.key=="is-java-17-supported") | .value'`.
+3. First value `"true"` wins. Write `tmp/connector-choices/<nick>-new.json` with `{groupId, assetId, version, java17: "ok", walkback_steps: N}`.
+4. If the walk exhausts 5 versions without a `"true"` hit — or if the tag is absent from every version — exit non-zero and produce no output file for this connector.
+
+**HALT on miss.** If any connector fails to produce an output file after `wait`, HALT the entire upgrade:
+
+> "Cannot upgrade: connector `<artifactId>` has no Java-17-compatible version in its latest 5 releases on Exchange. Upgrade is not possible for this project."
+
+Do NOT proceed to Mode-A / §2 with a partial pin set — Step 5's Mode-A describe expects every in-scope connector to have a `-new.json`.
+
+**Why walk-back bounded at 5.** Connectors with 5 consecutive non-Java-17 releases are structurally unsupported for Java 17; going deeper is unlikely to help and produces long-running Exchange call chains. v2 may parameterize the depth.
+
+**Output file contract.** `tmp/connector-choices/<nick>-new.json` is the same shape downstream steps expect — `scripts/promote_new_connector_pins.sh` and `scripts/apply_connector_pin.sh` consume it in Step 14.
+
+**Script:** `scripts/get_java17_compatible_connector.sh <groupId> <artifactId> <nick>` implements the walk-back. Exit codes: `0` = pick written, `2` = asset not found in Exchange, `3` = no Java-17 version in latest 5.
+
+---
+
 ## §2 Mode-A summary describe
 
 Per-connector summary — one call per connector in the pom.
