@@ -37,14 +37,20 @@ grep -E "NoSuchMethodError|doesn't support|ClassNotFoundException" /tmp/xlog.log
 
 For each in-scope connector, resolve the latest Java-17-compatible version BEFORE Mode-A summary describe runs. This step uses `anypoint-cli-v4 exchange asset` metadata (not the CLI's `dx mule describe-connector` introspection) — Exchange tags carry a `is-java-17-supported` flag that lets us pick a pin without a runtime describe.
 
-**Search token:** the connector's `artifactId` verbatim, filtered by `--type Extension`.
+**Search token:** the connector's `artifactId` verbatim. The type filter is applied **client-side** on the returned JSON — `anypoint-cli-v4 exchange asset list` does NOT support `--type` as a server-side filter (attempting it returns unfiltered results silently, mixing example-projects and extensions and typically producing wrong version picks).
 
 **Algorithm** (per connector; run in parallel, capped at 10 concurrent):
 
-1. `anypoint-cli-v4 exchange asset list <artifactId> --type Extension --output json` → filter to entries whose `assetId` matches exactly, sort versions semver-descending, keep top 5.
+1. `anypoint-cli-v4 exchange asset list <artifactId> --output json --limit 200` → filter to entries whose `assetId` matches exactly AND `.type` (case-insensitive) equals `"extension"`, sort versions semver-descending, keep top 5.
 2. Walk latest → oldest for at most 5 versions: `anypoint-cli-v4 exchange asset describe "<groupId>/<assetId>/<version>" --output json | jq '.tags[]? | select(.key=="is-java-17-supported") | .value'`.
 3. First value `"true"` wins. Write `tmp/connector-choices/<nick>-new.json` with `{groupId, assetId, version, java17: "ok", walkback_steps: N}`.
 4. If the walk exhausts 5 versions without a `"true"` hit — or if the tag is absent from every version — exit non-zero and produce no output file for this connector.
+
+**Version-downgrade gate.** Compare the walker's pick against the connector's `from` version in `tmp/upgrade-targets.json`. If the pick is semver-**less-than** `from` (e.g. walker returns vm-connector 2.0.1 when the app is pinned to 2.0.5 — the latest publicly-visible Java-17 release trails the app's private pin), surface it via `AskUserQuestion` at the end of Step 6 before advancing to Step 7:
+
+> Connector `<artifactId>` current pin is `<from>`. The latest Java-17-compatible version on Exchange is `<pick>`, which is a **downgrade**. Options: (a) proceed with the downgrade (private pin may not exist in public Exchange), (b) keep the current pin and skip this connector's upgrade, (c) cancel.
+
+Do NOT silently apply a downgrade — the private-vs-public visibility mismatch is invisible from `pom.xml` alone, and users need to consent.
 
 **HALT on miss.** If any connector fails to produce an output file after `wait`, HALT the entire upgrade:
 
@@ -130,6 +136,8 @@ Each call writes `tmp/connector-metadata/<nick>-new-<op>.json` containing:
 - `errorTypes[]` — the per-op error catalog
 
 **Renamed ops.** For operations in `usage.operations_used[]` that are NOT in `new.operations[]`, pick a rename candidate (Levenshtein-close or same semantic role) and describe the guessed NEW target as well — so the plan enumerates the rename with real metadata backing it, not a bare guess.
+
+**Mode-B failure-as-rename-signal.** If a `describe-connector --type operation --name <op>` call returns non-zero or empty output, treat that as a strong rename signal — the op likely doesn't exist under that name in the NEW catalog. Before advancing, cross-check `<op>` against `new.operations[]` from `<nick>-new.json`. If absent, pick the nearest rename candidate (e.g. `createObject` → `putObject`, `deleteObject` → `deleteObject`, `readObject` → `getObject` for S3 8.x) and re-run Mode-B on the candidate. Log the guessed rename in `tmp/connector-metadata/<nick>-op-renames.json` so §7's plan can enumerate it explicitly. **Never** silently skip the op — the flow XML still calls it.
 
 ---
 
@@ -302,5 +310,14 @@ Before the plan is handed to the user, every connector must have all four artifa
 - [ ] `tmp/connector-metadata/<nick>-new-<config>-<provider>.json` — Mode-C describe **for every (config, provider) pair the flow uses**
 
 Diff each Mode-B `.attributes[].attributeName` against the same site's `usage.usage_sites[].attributes_set` keys — a rename is a `usage` key absent from `.attributes[]` AND a `.attributes[]` name absent from `usage`. Diff `usage.errorTypes_caught[]` against `<nick>-new-<op>.json .errorTypes[]` and `<nick>-new.json .errorTypes[]` — a caught type that isn't in either is a mapping the plan must resolve. Diff Mode-C `.elementName` and `.connectionProviders[].elementName` against `usage.configs_used[]` and `usage.config_providers_used[]` — a mismatched local-name is a config-element rewrite the plan must enumerate.
+
+**Field-name convention (Mode-B / Mode-C JSON).** Attributes are keyed on `.attributeName` (NOT `.name`) in the describe-connector output. Extraction scripts and jq expressions must use `.attributes[].attributeName` — using `.attributes[].name` silently returns null and produces empty diffs that hide real renames.
+
+**Provider-level child-tree diff (mandatory, in addition to config-level).** Diff Mode-C's `.connectionProviders[].childElements[]` (case-insensitive local-names) against the OLD flow's provider-child tree — not just the config-level `.childElements[]`. Connectors sometimes **reparent** children between the config and the connection provider across releases (e.g. mule-db-connector moves `<db:pooling-profile>` from `<db:config>` child to `<db:oracle-connection>` child in 1.16.x). Config-level XSDs tend to be lenient about misplaced children so the failure surfaces at runtime, not `mvn` — enumerate both diffs explicitly:
+
+- `.elementName` (config-level `.childElements[]`) vs `usage.configs_used[]` child tree
+- `.connectionProviders[].elementName` (provider-level `.childElements[]`) vs `usage.config_providers_used[]` child tree
+
+**errorTypes diff is mandatory, not opportunistic.** For every op the plan will rewrite, produce a set difference: `usage.errorTypes_caught[] - (<nick>-new-<op>.json .errorTypes[] ∪ <nick>-new.json .errorTypes[])`. Any non-empty residue MUST appear in §7's "Connector-wide error type renames" section with a mapped-to value from Mode-A `.errorTypes[]` (Levenshtein-close, or same semantic role — e.g. `S3:BUCKET_NOT_FOUND` → `S3:NO_SUCH_BUCKET`). Do not defer this to "will fail at build time and self-correct" — build-time self-correction consumes retry budget and hides the real diff from the user.
 
 If any diff surfaces a symbol the plan does not enumerate, that plan is incomplete — go back to §4/§5, re-describe, and re-synthesize. "Build breaks after skill claims success" is almost always metadata-present-but-ignored.

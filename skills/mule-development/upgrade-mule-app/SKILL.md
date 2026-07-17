@@ -231,6 +231,8 @@ If any connector's walk-back exhausts 5 versions without a Java-17 hit, HALT the
 
 Do NOT proceed to Step 7 until every connector has a `tmp/connector-choices/<nick>-new.json`.
 
+**Version-downgrade check.** After all `<nick>-new.json` are written, cross-check each pick against `.connectors[].from` in `tmp/upgrade-targets.json`. If any pick is semver-less-than the current pin (e.g. walker returns `vm-connector 2.0.1` when the app is pinned to `2.0.5`), HALT and route through `AskUserQuestion` per `references/plan-connector-upgrades.md §1.5` before proceeding to Step 7. The most common cause is a private (org-visible) pin whose public Exchange listing has a lower latest — the user must consent to downgrade or opt to keep the current pin.
+
 - Check if each connector from pom is available in Exchange
 - Get min + latest compatible versions for each connector
 
@@ -239,6 +241,19 @@ Do NOT proceed to Step 7 until every connector has a `tmp/connector-choices/<nic
 ## Step 7: Check Operations/Configs/Error Types Changes
 
 See `references/plan-connector-upgrades.md` §2–§5 (Mode-A summary, usage enumeration, Mode-B per-op, Mode-C per-config-provider).
+
+**Before invoking Mode-B**, intersect `usage.operations_used[]` with `<nick>-new.json .operations[]`:
+
+- Op present in `.operations[]` → run Mode-B on it.
+- Op **absent** from `.operations[]` → the op was renamed or removed. Pick the closest rename candidate (Levenshtein-close or same semantic role — e.g. S3 8.x: `createObject` → `putObject`, `readObject` → `getObject`) and run Mode-B on the **candidate**. Log the guessed rename in `tmp/connector-metadata/<nick>-op-renames.json` so §7's plan enumerates it explicitly. Never silently skip an op — the flow XML still calls it.
+
+**After Mode-B / Mode-C complete**, run the mandatory diffs listed in §8 (`references/plan-connector-upgrades.md`):
+
+- Mode-B `.attributes[].attributeName` (NOT `.name`) vs `usage.usage_sites[].attributes_set` keys → attribute renames
+- `usage.errorTypes_caught[]` vs Mode-B `.errorTypes[]` ∪ Mode-A `.errorTypes[]` → error-type renames (**mandatory**, not opportunistic — deferring these to build-time self-correction consumes retry budget)
+- Mode-C `.connectionProviders[].childElements[]` vs OLD flow provider-child tree → child reparenting (e.g. mule-db-connector 1.16.x moves `<db:pooling-profile>` from `<db:config>` child to `<db:oracle-connection>` child)
+
+Every diff residue MUST appear in §7 plan output as an explicit per-symbol edit.
 
 - Describe connector operations for version changes
 - Identify changes to operations, configs, error types

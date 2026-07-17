@@ -33,12 +33,12 @@ NICK="$3"
 OUT_DIR="tmp/connector-choices"
 mkdir -p "$OUT_DIR"
 
-# 1. Enumerate versions from Exchange, filter to type=Extension.
-LIST_JSON=$(anypoint-cli-v4 exchange asset list "$ARTIFACT" --type Extension --output json)
+# 1. Enumerate versions from Exchange (no server-side --type filter; CLI doesn't support it).
+LIST_JSON=$(anypoint-cli-v4 exchange asset list "$ARTIFACT" --output json --limit 200)
 
-# 2. Pull versions for this exact assetId, sort semver-descending, keep top 5.
+# 2. Pull versions for this exact assetId + type=extension, sort semver-descending, keep top 5.
 VERSIONS=$(echo "$LIST_JSON" | jq -r --arg a "$ARTIFACT" '
-  [ .[] | select(.assetId == $a) | .version ]
+  [ .[] | select(.assetId == $a and (.type // "" | ascii_downcase) == "extension") | .version ]
   | sort_by(split(".") | map(tonumber? // 0))
   | reverse
   | .[]
