@@ -251,7 +251,10 @@ See `references/plan-connector-upgrades.md` §2–§5 (Mode-A summary, usage enu
 
 - Mode-B `.attributes[].attributeName` (NOT `.name`) vs `usage.usage_sites[].attributes_set` keys → attribute renames
 - `usage.errorTypes_caught[]` vs Mode-B `.errorTypes[]` ∪ Mode-A `.errorTypes[]` → error-type renames (**mandatory**, not opportunistic — deferring these to build-time self-correction consumes retry budget)
-- Mode-C `.connectionProviders[].childElements[]` vs OLD flow provider-child tree → child reparenting (e.g. mule-db-connector 1.16.x moves `<db:pooling-profile>` from `<db:config>` child to `<db:oracle-connection>` child)
+- Mode-C child-tree diff — **recursive**, at BOTH scopes:
+  - `.childElements[]` (config-level, walked recursively into every nested `.childElements[]` / `.containedElements[]`) vs OLD flow config-child tree
+  - `.connectionProviders[].childElements[]` (provider-level, walked recursively) vs OLD flow provider-child tree
+  Catches reparenting between config ↔ provider (e.g. `mule-db-connector` 1.16.x moves `<db:pooling-profile>` from `<db:config>` child to `<db:oracle-connection>` child) AND catches nested-structure diffs like `<vm:queues><vm:queue …/></vm:queues>` where the whole subtree lives under a config-level child, not a provider. Do not stop at the top-level names — a rename or restructure two levels deep will be missed.
 
 Every diff residue MUST appear in §7 plan output as an explicit per-symbol edit.
 

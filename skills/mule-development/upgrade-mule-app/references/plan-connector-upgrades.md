@@ -313,10 +313,24 @@ Diff each Mode-B `.attributes[].attributeName` against the same site's `usage.us
 
 **Field-name convention (Mode-B / Mode-C JSON).** Attributes are keyed on `.attributeName` (NOT `.name`) in the describe-connector output. Extraction scripts and jq expressions must use `.attributes[].attributeName` — using `.attributes[].name` silently returns null and produces empty diffs that hide real renames.
 
-**Provider-level child-tree diff (mandatory, in addition to config-level).** Diff Mode-C's `.connectionProviders[].childElements[]` (case-insensitive local-names) against the OLD flow's provider-child tree — not just the config-level `.childElements[]`. Connectors sometimes **reparent** children between the config and the connection provider across releases (e.g. mule-db-connector moves `<db:pooling-profile>` from `<db:config>` child to `<db:oracle-connection>` child in 1.16.x). Config-level XSDs tend to be lenient about misplaced children so the failure surfaces at runtime, not `mvn` — enumerate both diffs explicitly:
+**Recursive child-tree diff, mandatory at both scopes.** Diff Mode-C's child trees (case-insensitive local-names) against the OLD flow's child trees at both the config level AND the provider level. Config-level XSDs tend to be lenient about misplaced children so the failure surfaces at runtime, not `mvn`. Two things must be true:
 
-- `.elementName` (config-level `.childElements[]`) vs `usage.configs_used[]` child tree
-- `.connectionProviders[].elementName` (provider-level `.childElements[]`) vs `usage.config_providers_used[]` child tree
+1. **Both scopes are diffed, not just one.** Enumerate both:
+   - `.childElements[]` (config-level) vs `usage.configs_used[]` child tree
+   - `.connectionProviders[].childElements[]` (provider-level) vs `usage.config_providers_used[]` child tree
+
+   This catches **reparenting** between config ↔ provider across releases — e.g. mule-db-connector 1.16.x moves `<db:pooling-profile>` from `<db:config>` child to `<db:oracle-connection>` child. Diffing only one scope misses it entirely.
+
+2. **The walk is recursive.** For every `.childElements[]` node encountered, recurse into its own `.childElements[]` and `.containedElements[]` — do NOT stop at the top-level names. Nested-structure diffs live two or more levels deep: e.g. mule-vm-connector's queues are `<vm:queues><vm:queue queueName= queueType= .../></vm:queues>` — a top-level check only sees `queues`, but a rename or attribute change on the inner `<queue>` (or its `queueType` enum, or `maxOutstandingMessages`) will be missed unless the walker descends into it. Same shape appears in TLS contexts (`<tls:context><tls:trust-store>/<tls:key-store>/<tls:revocation-check>...</tls:context>`), reconnection strategies, column-types, and any other nested SDK grouping.
+
+   Practical jq extraction (recursive local-names):
+   ```bash
+   jq '[.. | objects | .elementName? | select(. != null)] | unique' \
+     tmp/connector-metadata/<nick>-new-<config>-<provider>.json
+   ```
+   That gives the flat set of every element the new schema accepts anywhere under the (config, provider) subtree. Diff against a matching flat set extracted from the OLD flow-XML subtree rooted at `usage.configs_used[]` / `usage.config_providers_used[]`. Residues on either side are edits the plan must enumerate.
+
+**If a residue appears deep in the tree, place the edit at the exact `file:line` inside the config block** (not on the outer config element) — the plan's Config-element block (§7 template) must list nested paths explicitly, not just the top-level rewrite.
 
 **errorTypes diff is mandatory, not opportunistic.** For every op the plan will rewrite, produce a set difference: `usage.errorTypes_caught[] - (<nick>-new-<op>.json .errorTypes[] ∪ <nick>-new.json .errorTypes[])`. Any non-empty residue MUST appear in §7's "Connector-wide error type renames" section with a mapped-to value from Mode-A `.errorTypes[]` (Levenshtein-close, or same semantic role — e.g. `S3:BUCKET_NOT_FOUND` → `S3:NO_SUCH_BUCKET`). Do not defer this to "will fail at build time and self-correct" — build-time self-correction consumes retry budget and hides the real diff from the user.
 
