@@ -47,6 +47,8 @@ anypoint-cli-v4 conf username <username>
 anypoint-cli-v4 conf password <password>
 ```
 
+**Requires:** Mule Runtime **4.4+** and Java **8+**. Apps below either are not supported, upgrade to the baseline first.
+
 **Required files in project:**
 - `mule-artifact.json` - Mule application metadata
 - `pom.xml` - Maven configuration
@@ -56,11 +58,14 @@ anypoint-cli-v4 conf password <password>
 
 ## Bundled scripts
 
-This skill ships small bash scripts under `scripts/`. Invoke them with the `Bash` tool — do not inline their contents into a response. The scripts persist their output to disk so later steps can consume it mechanically and are not at the mercy of shell variables that vanish when a Bash tool call returns:
+This skill ships small scripts under `scripts/`. Invoke them with the `Bash` tool — do not inline their contents into a response. The scripts persist their output to disk so later steps can consume it mechanically and are not at the mercy of shell variables that vanish when a Bash tool call returns:
 
 | Script | Purpose | Output location |
 | --- | --- | --- |
-| (To be added as scripts are implemented) | | |
+| `scripts/validate_prerequisites.mjs` | Step 1 — validate app directory (`pom.xml` + `mule-artifact.json`), parent-POM availability (if referenced), `JAVA_HOME` / `java -version`, Anypoint CLI v4, DX plugin. Validation-ONLY; exits non-zero when `errors[]` is non-empty | `tmp/upgrade-prereqs.json` (contains `inAppDir`, `parentDeclared`, `parentFound`, `javaVersion`, `cliPresent`, `dxPluginPresent`, `errors[]`, ...) |
+| `scripts/detect_current_mule_version.mjs` | Step 2a — determine the current Mule Runtime version from child/parent `pom.xml`, cross-check `mule-artifact.json` `minMuleVersion`, and flag versions below the supported floor (4.4) | `tmp/current-mule-version.json` (contains `version`, `source`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `muleArtifact.consistency`, `warnings[]`, ...) |
+| `scripts/detect_current_java_version.mjs` | Step 2b — determine the current Java version from `mule-artifact.json` `javaSpecificationVersions`, falling back to `pom.xml` compiler settings (child/parent), and flag versions below the supported floor (8) | `tmp/current-java-version.json` (contains `version`, `source`, `supportedVersions`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
+| `scripts/_pom_utils.mjs` | Shared library — tolerant XML parser, `${...}` property resolution, and parent-POM location used by the three scripts above. Not invoked directly | (imported) |
 
 Invoke scripts by the absolute path you were given in the "skill is now active" message (it is the directory containing this `SKILL.md`). Do **not** construct relative paths like `../scripts/...` — Cline's working directory shifts across turns and relative paths have produced "No such file or directory" errors in real runs. The inline step examples below write `scripts/...` as shorthand; substitute `<skill-dir>/scripts/...` when you actually execute them.
 
@@ -92,20 +97,65 @@ Phase 2 MUST NOT start until Step 12's approval gate has been passed explicitly.
 
 ## Step 1: Validate Prerequisites
 
-(To be implemented)
+Run the prerequisite validation script. It only validates — it writes nothing to the project and never prompts:
 
-- User is in app directory
-- App available locally (mule-artifact.json and pom.xml exist)
-- Parent POM availability (if referenced)
+```bash
+node scripts/validate_prerequisites.mjs .
+```
+
+It writes `tmp/upgrade-prereqs.json` and prints the same object. **If the script exits non-zero (i.e. `errors[]` is non-empty), STOP and act on the errors before progressing.** The most common ones:
+
+- **Not in an app directory** (`pom.xml` / `mule-artifact.json` missing) → tell the user to run from the Mule application root.
+- **Parent POM declared but not found locally** (`parentDeclared: true`, `parentFound: false`) → the parent is required both for version detection (Step 2) and for Phase 2 edits (inherited connector/plugin versions, Steps 14/19). Ask the user to make the parent POM available locally (workspace or `~/.m2`) and re-run. **Do not attempt to download it.**
+- **Toolchain missing** (`javaVersion` null, `cliPresent` / `dxPluginPresent` false) → point the user at the install commands in Prerequisites.
+
+Only proceed to Step 2 once the script exits zero.
 
 ---
 
 ## Step 2: Get Current Versions
 
-(To be implemented)
+### 2a. Current Mule Runtime version
 
-- Get current Mule version from pom.xml
-- Get current Java version from mule-artifact.json
+Run the detection script (do not parse the POM inline — the script implements the full child → parent → property-resolution logic):
+
+```bash
+node scripts/detect_current_mule_version.mjs .
+```
+
+It writes `tmp/current-mule-version.json` and prints the same object. Read the result and branch on it:
+
+- **`belowFloor: true`** → the detected `version` is below the minimum supported Mule Runtime (`minSupportedVersion`, currently 4.4). This app is **out of scope** — there is no valid version to prompt for. **Stop** and tell the user to upgrade the app to at least that version before running this skill (see `warnings`).
+- **`version` set, `needsUserPrompt: false`** → use `version` as the current Mule Runtime version. Continue.
+- **`needsUserPrompt: true`** → the script could not settle on a trustworthy version. Inspect `warnings` / `consistency`:
+  - `consistency: "below-min"` → the detected `version` is **below** `mule-artifact.json`'s `minMuleVersion` (inconsistent config). Show the user both the detected version and the floor, ask them to confirm or correct the current version, then continue with the confirmed value. If they cannot, **stop**.
+  - parent declared but not found locally → ask the user to make the parent POM available locally, then re-run this step. **Do not attempt to download it.**
+  - otherwise (nothing resolvable) → ask the user for the current Mule Runtime version. If they cannot provide it, **stop**.
+
+**Floor also applies to a user-supplied version.** Whenever you obtain the current Mule version from the user (any prompt above), apply the same floor yourself: if it is below `minSupportedVersion` (4.4), the app is out of scope — **stop** with the same guidance. The script only floor-checks the version *it* detected; a value the user typed is yours to validate.
+
+Detection order (implemented by the script): child `pom.xml` plugin `<muleVersion>`, then child runtime property (`app.runtime`, then `mule.version`), then the same in the parent POM, resolving `${...}` against the merged child+parent properties. Unresolvable references fall through rather than being accepted literally.
+
+### 2b. Current Java version
+
+Run the detection script (do not read `mule-artifact.json` inline — the script implements the full mule-artifact → POM fallback with `${...}` resolution):
+
+```bash
+node scripts/detect_current_java_version.mjs .
+```
+
+It writes `tmp/current-java-version.json` and prints the same object. Read the result and branch on it:
+
+- **`belowFloor: true`** → the detected `version` is below the minimum supported Java (`minSupportedVersion`, currently 8). This app is **out of scope** — **stop** and tell the user to upgrade the app to at least Java 8 before running this skill (see `warnings`).
+- **`version` set, `needsUserPrompt: false`** → use `version` as the current Java version. If `source` starts with `pom.` you MAY confirm it with the user (it is the compile target, not guaranteed to be the runtime Java), but proceeding is fine.
+- **`needsUserPrompt: true`** → inspect `warnings` / `supportedVersions`:
+  - `supportedVersions` has multiple entries → `mule-artifact.json` declares support for several Java versions; ask the user which one the app currently runs on, then continue.
+  - parent declared but not found locally → ask the user to make the parent POM available locally, then re-run this step. **Do not attempt to download it.**
+  - otherwise (nothing resolvable) → ask the user for the current Java version. If they cannot provide it, **stop**.
+
+**Floor also applies to a user-supplied version.** Whenever you obtain the current Java version from the user (any prompt above), apply the same floor yourself: if it is below `minSupportedVersion` (8), the app is out of scope — **stop** with the same guidance. The script only floor-checks the version *it* detected.
+
+Detection order (implemented by the script): `mule-artifact.json` `javaSpecificationVersions` (one entry → use it; multiple → prompt); if absent/empty, fall back to `pom.xml` compiler settings (`maven-compiler-plugin` `release`/`source`/`target`, then properties `maven.compiler.release`/`source`/`target`, `java.version`) across child and parent, resolving `${...}` and normalizing `1.8` → `8`.
 
 ---
 
@@ -324,7 +374,7 @@ Present final summary:
 
 **Runtime path required:** first use of `dx mule describe-connector` or related commands prompts for runtime location. The path is saved to `~/.mule-dx/config.json`.
 
-**Parent POM not available:** check workspace or local `.m2` repository. Parent POM must be accessible locally to resolve inherited versions.
+**Parent POM not available:** the parent POM must be accessible locally to resolve inherited versions. Do **not** attempt to download it — ask the user to make it available locally, then re-run Step 2.
 
 **Connector not in Exchange:** cannot upgrade automatically. Flag as blocker and inform user.
 
@@ -339,5 +389,12 @@ Present final summary:
 `<skill-dir>` below is the absolute path you were given in the "skill is now active" message. Use it consistently — do not construct relative `../scripts/...` paths.
 
 ```bash
-# Placeholder for command reference as scripts are added
+# Step 1 — validate prerequisites (writes tmp/upgrade-prereqs.json; non-zero exit => STOP)
+node <skill-dir>/scripts/validate_prerequisites.mjs .
+
+# Step 2a — detect current Mule Runtime version (writes tmp/current-mule-version.json)
+node <skill-dir>/scripts/detect_current_mule_version.mjs .
+
+# Step 2b — detect current Java version (writes tmp/current-java-version.json)
+node <skill-dir>/scripts/detect_current_java_version.mjs .
 ```
