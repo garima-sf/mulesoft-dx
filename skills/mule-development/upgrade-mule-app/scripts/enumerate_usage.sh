@@ -53,9 +53,42 @@ METADATA_DIR="${CONNECTOR_METADATA_DIR:-tmp/connector-metadata}"
 NEW_META="$METADATA_DIR/${NICKNAME}-new.json"
 OLD_META="$METADATA_DIR/${NICKNAME}-old.json"
 
+# Nickname-mismatch fallback: the caller may pass the XSD prefix (`crypto`,
+# `os`, `xml-module`) while describe_connector.sh persisted under the
+# artifact slug (`cryptography-new.json`, `objectstore-new.json`,
+# `xml-new.json`). When the direct file is missing, scan every
+# *-new.json in $METADATA_DIR and match on .namespace.prefix — that's
+# the ground truth for the XSD prefix, keyed off the actual describe
+# output rather than either side of the nickname convention.
 if [ ! -f "$NEW_META" ]; then
-    echo "❌ missing $NEW_META — run describe_connector.sh ${NICKNAME}-new first" >&2
-    exit 1
+    MATCH=""
+    shopt -s nullglob
+    for cand in "$METADATA_DIR"/*-new.json; do
+        # Skip per-op / per-provider files (they have extra suffixes after
+        # the nick, e.g. saml-new-generateSaml.json). Only consider the
+        # bare `<nick>-new.json` shape.
+        base="$(basename "$cand")"
+        stem="${base%-new.json}"
+        # Reject if stem contains another `-new-` segment.
+        case "$base" in
+            *-new-*) continue ;;
+        esac
+        cand_prefix="$(jq -r 'if (.namespace | type) == "object" then (.namespace.prefix // "") else "" end' "$cand" 2>/dev/null || true)"
+        if [ -n "$cand_prefix" ] && [ "$cand_prefix" = "$NICKNAME" ]; then
+            MATCH="$cand"
+            echo "ℹ️  nickname '$NICKNAME' resolved to $(basename "$cand") via .namespace.prefix" >&2
+            NICKNAME="$stem"
+            NEW_META="$cand"
+            OLD_META="$METADATA_DIR/${stem}-old.json"
+            break
+        fi
+    done
+    shopt -u nullglob
+    if [ -z "$MATCH" ]; then
+        echo "❌ missing $METADATA_DIR/${NICKNAME}-new.json — run describe_connector.sh ${NICKNAME}-new first" >&2
+        echo "   (also scanned every *-new.json in $METADATA_DIR for .namespace.prefix=='$NICKNAME' — no match)" >&2
+        exit 1
+    fi
 fi
 
 FLOW_DIR="$PROJECT_DIR/src/main/mule"
@@ -72,10 +105,17 @@ if [ "${#FLOW_FILES[@]}" -eq 0 ]; then
     exit 1
 fi
 
-# Extract the prefix from NEW metadata.
-NEW_PREFIX="$(jq -r '.namespace.prefix // empty' "$NEW_META")"
+# Extract the prefix from NEW metadata. The `.namespace | type == "object"`
+# guard handles the case where a hand-drafted metadata file (e.g. for an
+# entitlement-gated connector whose CLI describe was blocked) wrote
+# `.namespace` as a bare string — without this, jq exits with
+# `Cannot index string with string "prefix"` and P5 dies loudly with
+# nothing to recover from.
+NEW_PREFIX="$(jq -r 'if (.namespace | type) == "object" then (.namespace.prefix // "") else "" end' "$NEW_META")"
 if [ -z "$NEW_PREFIX" ]; then
-    echo "❌ $NEW_META has no .namespace.prefix" >&2
+    echo "❌ $NEW_META has no .namespace.prefix (or .namespace is a bare string, not an object)" >&2
+    echo "   actual: $(jq -c '.namespace // null' "$NEW_META" 2>/dev/null)" >&2
+    echo "   fix: rewrite as {\"prefix\": \"<xsd-prefix>\", \"namespace\": \"<uri>\", \"schemaLocation\": \"<uri>/current/<file>.xsd\"} and re-run" >&2
     exit 1
 fi
 

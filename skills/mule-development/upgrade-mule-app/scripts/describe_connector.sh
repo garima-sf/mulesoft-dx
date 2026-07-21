@@ -255,6 +255,23 @@ if [ ! -s "$OUT_TMP" ]; then
     exit 1
 fi
 
+# Guard: connector-wide (Mode-A) metadata must expose .namespace.prefix as a
+# non-empty string inside an OBJECT. enumerate_usage.sh (P5) reads it via
+# `jq -r '.namespace.prefix'` and errors with "Cannot index string with
+# string" when a caller (or a hand-drafted fallback) writes .namespace as a
+# bare string. Fail here so the bad shape never lands on disk and P5 can't
+# silently produce an empty tmp/connector-usage/<nick>.json downstream.
+if [ -z "$TYPE" ]; then
+    NS_PREFIX="$(jq -r 'if (.namespace | type) == "object" then (.namespace.prefix // "") else "" end' "$OUT_TMP" 2>/dev/null || true)"
+    if [ -z "$NS_PREFIX" ]; then
+        echo "❌ describe-connector output for $GAV has malformed .namespace (must be an object with a non-empty .prefix)" >&2
+        echo "   actual: $(jq -c '.namespace // null' "$OUT_TMP" 2>/dev/null)" >&2
+        echo "   expected: {\"prefix\": \"<xsd-prefix>\", \"namespace\": \"...\", \"schemaLocation\": \"...\"}" >&2
+        echo "   Refusing to persist $METADATA_JSON — P5 would blow up on jq indexing." >&2
+        exit 1
+    fi
+fi
+
 mv "$OUT_TMP" "$METADATA_JSON"
 
 # Persist the error-type whitelist (top-level .errorTypes) so the

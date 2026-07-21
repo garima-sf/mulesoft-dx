@@ -185,6 +185,10 @@ For each connector nickname `<nick>` in `tmp/upgrade-targets.json`:
 <skill-dir>/scripts/describe_connector.sh <nick>-new
 ```
 
+**Nickname discipline (BLOCKER).** `<nick>` MUST equal the XSD prefix the flow XML uses (`crypto`, `os`, `xml-module`, `saml`), NOT the artifact slug (`cryptography`, `objectstore`, `xml`). The prefix is the join key between this step's metadata output and Step 7's usage extraction — pick from the flow XML `xmlns:<prefix>=...` bindings, then keep it consistent across Steps 5 → 7 (Mode-B) → 7 (Mode-C). `enumerate_usage.sh` will still resolve a mismatched nick by scanning every `*-new.json` for `.namespace.prefix == <nick>`, but relying on that fallback means every downstream script has to be called with the right stem too — cheaper to get it right at Step 5.
+
+Verify `tmp/connector-metadata/<nick>-new.json` exists before proceeding, and that its `.namespace` is an object with a non-empty `.prefix`. `describe_connector.sh` refuses to persist a Mode-A file whose `.namespace` is a bare string — if the CLI describe is blocked (entitlement-gated connector) and you're hand-drafting metadata, follow the object shape `{"prefix": "...", "namespace": "...", "schemaLocation": "..."}` or Step 7's usage extractor will exit with a jq indexing error.
+
 Writes `tmp/connector-metadata/<nick>-new.json` — the top-level summary (operations, sources, configs, errorTypes, supportedJavaVersions). This is the input to Step 7's Mode-B (per-op) and Mode-C (per-config-provider) describes.
 
 Full algorithm and JSON shape: `references/plan-connector-upgrades.md §2 (Mode-A summary describe)`.
