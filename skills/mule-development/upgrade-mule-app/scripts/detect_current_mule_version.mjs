@@ -1,116 +1,63 @@
 #!/usr/bin/env node
-// detect-current-mule-version.mjs
 //
-// Determine the current Mule Runtime version of a Mule application by parsing
-// pom.xml (child, then parent) and cross-checking mule-artifact.json.
+// Copyright (c) 2026, Salesforce, Inc.
+// All rights reserved.
+// For full license text, see the LICENSE.txt file
 //
-// Deterministic order (see SKILL.md Step 2):
-//   1. Child  pom.xml : mule-maven-plugin <configuration><muleVersion>
-//   2. Child  pom.xml : runtime property  (app.runtime, then mule.version)
-//   3. Parent pom.xml : repeat 1 then 2
-//   4. Otherwise      : caller must prompt the user
-// Then cross-check against mule-artifact.json minMuleVersion.
+// Part of upgrade-mule-app skill.
 //
-// Key rules:
-//   - A ${prop} reference is resolved against the MERGED property table
-//     (child <properties> first, then parent <properties>). This lets a child
-//     <muleVersion>${app.runtime}</muleVersion> resolve even when app.runtime
-//     is declared only in the parent.
-//   - An unresolvable ${prop} is NEVER accepted as a literal version; the
-//     search falls through to the next source.
-//   - Only <configuration><muleVersion> (direct child) is authoritative.
-//     A muleVersion inside a deployment block is a weaker signal and ignored
-//     here.
+// Step 2a helper — detect the current Mule Runtime version from the `app.runtime`
+// property (child pom.xml, then parent). ${...} refs resolve against the merged
+// child+parent properties. Never prompts; signals the caller via needsUserPrompt.
 //
 // Usage:
-//   node detect-current-mule-version.mjs [projectDir] [--out <file>]
+//   node detect_current_mule_version.mjs [projectDir]
+//   Default projectDir = cwd. Output path: ${CURRENT_MULE_VERSION_FILE} when set,
+//   otherwise <projectDir>/tmp/current-mule-version.json.
 //
-// Default projectDir = cwd. Default out = <projectDir>/tmp/current-mule-version.json
-// Prints a JSON summary to stdout and persists the same object to disk.
+// Output JSON (file): { version, source, resolvedFrom, needsUserPrompt,
+//   belowFloor, minSupportedVersion, warnings[], notes[] }.
+//
+// Exit code:
+//   0  always — detection is advisory; the caller branches on version /
+//      needsUserPrompt / belowFloor rather than the exit status.
 
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 import {
   PROP_REF,
   parseXml,
-  children,
   child,
-  textOf,
   projectOf,
   extractProperties,
   resolveValue,
   findParentPomPath,
 } from "./_pom_utils.mjs";
 
-// ---------------------------------------------------------------------------
-// POM extraction (Mule-runtime-specific)
-// ---------------------------------------------------------------------------
-const RUNTIME_PROPERTY_NAMES = ["app.runtime", "mule.version"];
-const MULE_MAVEN_PLUGIN = "mule-maven-plugin";
+// Don't crash if a downstream consumer (e.g. `head`) closes stdout early.
+process.stdout.on("error", (e) => { if (e.code === "EPIPE") process.exit(0); });
 
-// Lowest CURRENT Mule Runtime version the skill will upgrade from. Apps below
-// this are out of scope; the caller must stop (there is no valid answer to
-// prompt for). Documented in SKILL.md Prerequisites as "Mule 4.4+".
+function log(msg) {
+  process.stdout.write(msg + "\n");
+}
+
+// The only Maven property we read the MRT version from.
+const RUNTIME_PROPERTY_NAME = "app.runtime";
+
+// Lowest current version the skill upgrades from; below this is out of scope.
 const MIN_SUPPORTED_MULE_VERSION = "4.4";
 
-// Direct <configuration><muleVersion> of mule-maven-plugin. Deployment-block
-// muleVersion (configuration/*/muleVersion) is intentionally ignored.
-function extractPluginMuleVersion(project) {
-  const build = child(project, "build");
-  if (!build) return null;
-  const collectPlugins = (buildNode) => {
-    const out = [];
-    for (const plugins of children(buildNode, "plugins")) {
-      out.push(...children(plugins, "plugin"));
-    }
-    // pluginManagement -> plugins -> plugin
-    for (const pm of children(buildNode, "pluginManagement")) {
-      for (const plugins of children(pm, "plugins")) {
-        out.push(...children(plugins, "plugin"));
-      }
-    }
-    return out;
-  };
-  for (const plugin of collectPlugins(build)) {
-    if (textOf(child(plugin, "artifactId")) !== MULE_MAVEN_PLUGIN) continue;
-    const config = child(plugin, "configuration");
-    if (!config) continue;
-    const mv = child(config, "muleVersion"); // direct child only
-    const raw = textOf(mv);
-    if (raw) return raw;
-  }
+// Read app.runtime from one POM's own properties, resolving ${...} against the
+// merged child+parent table. Returns { version, raw } or null (missing/unresolvable).
+function detectInProps(ownProps, mergedProps) {
+  if (!(RUNTIME_PROPERTY_NAME in ownProps)) return null;
+  const raw = ownProps[RUNTIME_PROPERTY_NAME];
+  const resolved = resolveValue(raw, mergedProps);
+  if (resolved) return { version: resolved, raw };
   return null;
 }
 
-// Apply Step-1/Step-2 logic to a single POM's project node.
-// ownProps: this POM's own <properties> (used for property PRESENCE check).
-// mergedProps: child-then-parent table (used to RESOLVE ${...}).
-function detectInProject(project, ownProps, mergedProps) {
-  // 1. plugin muleVersion
-  const pluginRaw = extractPluginMuleVersion(project);
-  if (pluginRaw) {
-    const resolved = resolveValue(pluginRaw, mergedProps);
-    if (resolved) {
-      return { version: resolved, source: "mule-maven-plugin.muleVersion", raw: pluginRaw };
-    }
-    // unresolved -> fall through
-  }
-  // 2. runtime property (ordered)
-  for (const name of RUNTIME_PROPERTY_NAMES) {
-    if (!(name in ownProps)) continue;
-    const resolved = resolveValue(ownProps[name], mergedProps);
-    if (resolved) {
-      return { version: resolved, source: `property:${name}`, raw: ownProps[name] };
-    }
-    // present but unresolved -> keep checking remaining names
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Version comparison (numeric dotted prefix; ignores qualifiers).
-// Returns negative / 0 / positive.
-// ---------------------------------------------------------------------------
+// Compare numeric dotted-prefix versions (qualifiers ignored). Returns -1/0/1.
 function compareVersions(a, b) {
   const pa = numericParts(a);
   const pb = numericParts(b);
@@ -127,38 +74,28 @@ function numericParts(v) {
   return m[0].split(".").map(Number);
 }
 
-// ---------------------------------------------------------------------------
-// Main
-// ---------------------------------------------------------------------------
 function main() {
   const argv = process.argv.slice(2);
   let projectDir = process.cwd();
-  let outPath = null;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--out") outPath = argv[++i];
-    else if (!argv[i].startsWith("--")) projectDir = resolve(argv[i]);
+    if (!argv[i].startsWith("--")) projectDir = resolve(argv[i]);
   }
   projectDir = resolve(projectDir);
-  if (!outPath) outPath = join(projectDir, "tmp", "current-mule-version.json");
+  const outPath = process.env.CURRENT_MULE_VERSION_FILE || join(projectDir, "tmp", "current-mule-version.json");
 
   const result = {
     projectDir,
-    version: null,          // resolved current Mule Runtime version, or null
-    source: null,           // where it came from
-    resolvedFrom: null,     // "child" | "parent" | null (needs user prompt)
+    version: null,          // resolved MRT version, or null
+    source: null,           // e.g. "app.runtime"
+    resolvedFrom: null,     // "child" | "parent" | null
     needsUserPrompt: false,
-    belowFloor: false,      // true if detected version < MIN_SUPPORTED_MULE_VERSION
+    belowFloor: false,      // version < MIN_SUPPORTED_MULE_VERSION
     minSupportedVersion: MIN_SUPPORTED_MULE_VERSION,
-    muleArtifact: {
-      present: false,
-      minMuleVersion: null,
-      consistency: null,    // "ok" | "no-min" | "below-min" | "unknown"
-    },
     warnings: [],
     notes: [],
   };
 
-  // --- Read child pom.xml ---
+  // Child pom.xml is required.
   const childPomPath = join(projectDir, "pom.xml");
   if (!existsSync(childPomPath)) {
     result.warnings.push(`No pom.xml found at ${childPomPath}`);
@@ -168,7 +105,7 @@ function main() {
   const childProject = projectOf(parseXml(readFileSync(childPomPath, "utf8")));
   const childProps = extractProperties(childProject);
 
-  // --- Read parent pom.xml (if any) ---
+  // Parent pom.xml, if declared and locally available.
   const parentPomPath = findParentPomPath(childProject, childPomPath);
   let parentProject = null;
   let parentProps = {};
@@ -181,95 +118,53 @@ function main() {
       result.warnings.push(`Failed to read parent POM ${parentPomPath}: ${e.message}`);
     }
   }
-  // Child declares a <parent> we could not load locally. How loud to be about
-  // this depends on whether detection actually needed the parent, so defer the
-  // message until after resolution (see below).
+  // Message severity depends on whether detection needed the parent; defer it.
   const parentDeclaredButMissing = !parentProject && !!child(childProject, "parent");
 
   // Merged table for ${...} resolution: child wins over parent.
   const mergedProps = { ...parentProps, ...childProps };
 
-  // --- Step 1-2: child POM ---
-  let found = detectInProject(childProject, childProps, mergedProps);
+  // Try child, then parent.
+  let found = detectInProps(childProps, mergedProps);
   if (found) {
     result.resolvedFrom = "child";
   } else if (parentProject) {
-    // --- Step 3: parent POM (own props for presence, merged for resolution) ---
-    found = detectInProject(parentProject, parentProps, mergedProps);
+    found = detectInProps(parentProps, mergedProps);
     if (found) result.resolvedFrom = "parent";
   }
 
   if (found) {
     result.version = found.version;
-    result.source = found.source;
+    result.source = RUNTIME_PROPERTY_NAME;
     if (PROP_REF.test(found.raw || "")) {
       result.notes.push(`Resolved ${found.raw} -> ${found.version}`);
     }
-    // Parent was declared but missing, yet we resolved from the child anyway:
-    // the missing parent did not matter here, so keep it as a low-key note.
+    // Resolved from the child, so the missing parent did not matter here.
     if (parentDeclaredButMissing) {
       result.notes.push(
-        "Child declares a <parent> whose POM was not found locally, but the " +
-        "Mule runtime version was resolved from the child pom.xml, so it was not needed."
+        "Child declares a <parent> whose POM was not found locally, but " +
+        "app.runtime was resolved from the child pom.xml, so it was not needed."
       );
     }
   } else {
-    // --- Step 4: caller must prompt the user ---
+    // Nothing resolvable: caller must prompt.
     result.needsUserPrompt = true;
     if (parentDeclaredButMissing) {
-      // The missing parent is the likely cause: a child ${...} reference or the
-      // muleVersion itself may be defined in the parent we could not load. Do NOT
-      // attempt to download it — ask the user to make it available locally.
       result.warnings.push(
         "Child declares a <parent>, but the parent POM was not found locally. " +
-        "Parent-defined Mule runtime configuration cannot be resolved. Ask the " +
-        "user to make the parent POM available locally and re-run."
+        "A parent-defined app.runtime cannot be resolved. Ask the user to make " +
+        "the parent POM available locally and re-run."
       );
     } else {
       result.warnings.push(
-        "Could not determine Mule Runtime version from child or parent pom.xml. " +
-        "Prompt the user for the current version."
+        "Could not determine Mule Runtime version from app.runtime in the child " +
+        "or parent pom.xml. Prompt the user for the current version."
       );
     }
   }
 
-  // --- Step 5: cross-check mule-artifact.json ---
-  const artifactPath = join(projectDir, "mule-artifact.json");
-  if (existsSync(artifactPath)) {
-    result.muleArtifact.present = true;
-    try {
-      const artifact = JSON.parse(readFileSync(artifactPath, "utf8"));
-      const min = artifact.minMuleVersion || null;
-      result.muleArtifact.minMuleVersion = min;
-      if (!min) {
-        result.muleArtifact.consistency = "no-min";
-      } else if (!result.version) {
-        result.muleArtifact.consistency = "unknown";
-      } else if (compareVersions(result.version, min) >= 0) {
-        result.muleArtifact.consistency = "ok";
-      } else {
-        result.muleArtifact.consistency = "below-min";
-        // Contradiction: the app builds today, so it cannot really run below its
-        // own floor. Either the detected version or minMuleVersion is stale. Do
-        // not proceed silently — force the caller back to the user to re-confirm.
-        result.needsUserPrompt = true;
-        result.warnings.push(
-          `Detected version ${result.version} is below mule-artifact.json ` +
-          `minMuleVersion ${min}. The project configuration appears inconsistent. ` +
-          `Please verify the current Mule Runtime version before proceeding.`
-        );
-      }
-    } catch (e) {
-      result.warnings.push(`Failed to parse mule-artifact.json: ${e.message}`);
-    }
-  } else {
-    result.muleArtifact.consistency = "unknown";
-    result.notes.push("No mule-artifact.json found (will surface at build time).");
-  }
-
-  // --- Floor check: skill only upgrades apps already on Mule 4.4+ ---
-  // Only meaningful for a detected version; a user-supplied version must be
-  // floor-checked by the caller (SKILL.md) after prompting.
+  // Floor check applies only to a detected version; the caller floor-checks
+  // any user-supplied value (SKILL.md).
   if (result.version && compareVersions(result.version, MIN_SUPPORTED_MULE_VERSION) < 0) {
     result.belowFloor = true;
     result.warnings.push(
@@ -284,14 +179,25 @@ function main() {
 }
 
 function emit(result, outPath) {
+  if (result.belowFloor) {
+    log(`❌ Detected Mule Runtime ${result.version} is below the minimum supported ${result.minSupportedVersion}.`);
+  } else if (result.version) {
+    const from = result.resolvedFrom ? ` (from ${result.resolvedFrom} pom.xml)` : "";
+    log(`✅ Current Mule Runtime: ${result.version}${from}`);
+  } else if (result.needsUserPrompt) {
+    log("⚠️  Could not auto-detect the Mule Runtime version — the agent must prompt the user.");
+  }
+  for (const w of result.warnings) log(`   • ${w}`);
+
   try {
     mkdirSync(dirname(outPath), { recursive: true });
     writeFileSync(outPath, JSON.stringify(result, null, 2));
     result.outPath = outPath;
+    log(`Saved to ${outPath}`);
   } catch (e) {
     result.warnings.push(`Failed to write ${outPath}: ${e.message}`);
+    log(`⚠️  Failed to write ${outPath}: ${e.message}`);
   }
-  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
   return result;
 }
 

@@ -1,63 +1,56 @@
 #!/usr/bin/env node
-// validate-prerequisites.mjs
 //
-// Step 1 — deterministic prerequisite validation for the upgrade-mule-app
-// skill. Checks only facts about the filesystem and toolchain; it never
-// prompts and never mutates the project. The caller (SKILL.md Step 1) reads
-// the result and STOPs if `errors[]` is non-empty.
+// Copyright (c) 2026, Salesforce, Inc.
+// All rights reserved.
+// For full license text, see the LICENSE.txt file
 //
-// Checks:
-//   - in an app directory (child pom.xml + mule-artifact.json present)
-//   - parent POM: if the child declares <parent>, is it resolvable locally?
-//   - toolchain: JAVA_HOME set, `java -version` works, Anypoint CLI v4 present,
-//     DX plugin present.
+// Part of upgrade-mule-app skill.
+//
+// Step 1 helper — validate filesystem and toolchain prerequisites: app directory
+// (pom.xml + mule-artifact.json), parent-POM availability if declared, Anypoint
+// CLI v4, DX plugin. Validation-only; never prompts or mutates.
 //
 // Usage:
-//   node validate-prerequisites.mjs [projectDir] [--out <file>]
+//   node validate_prerequisites.mjs [projectDir]
+//   Default projectDir = cwd. Output path: ${UPGRADE_PREREQS_FILE} when set,
+//   otherwise <projectDir>/tmp/upgrade-prereqs.json.
 //
-// Default projectDir = cwd. Default out = <projectDir>/tmp/upgrade-prereqs.json
-// Exits non-zero when `errors[]` is non-empty (mirrors build-mule-integration's
-// validate_prerequisites.sh contract), and always writes/prints the result.
+// Output JSON (file): { ok, inAppDir, pomExists, muleArtifactExists,
+//   parentDeclared, parentFound, parentPath, cliPresent, dxPluginPresent,
+//   errors[], warnings[], notes[] }. `ok` is true when errors[] is empty.
+//   Exit code: 1 when errors[] is non-empty.
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve, join } from "node:path";
 import { readPomProject, child, findParentPomPath } from "./_pom_utils.mjs";
 
+// Don't crash if a downstream consumer (e.g. `head`) closes stdout early.
+process.stdout.on("error", (e) => { if (e.code === "EPIPE") process.exit(0); });
+
+function log(msg) {
+  process.stdout.write(msg + "\n");
+}
+
+// Run a command, capturing both streams.
 function tryExec(cmd, args) {
-  // Capture BOTH streams; many CLIs (notably `java -version`) print to stderr.
   const r = spawnSync(cmd, args, { encoding: "utf8" });
   if (r.error) return { ok: false, out: "", error: r.error.message };
   const combined = `${r.stdout || ""}${r.stderr || ""}`.trim();
   return { ok: r.status === 0, out: combined };
 }
 
-// Parse a `java -version` string (which prints to stderr) into a spec number.
-//   'openjdk version "1.8.0_402"' -> "8"
-//   'openjdk version "17.0.10"'   -> "17"
-function parseJavaVersion(text) {
-  if (!text) return null;
-  const m = text.match(/version\s+"([^"]+)"/i);
-  if (!m) return null;
-  const v = m[1];
-  const legacy = v.match(/^1\.(\d+)/);
-  if (legacy) return legacy[1];
-  const modern = v.match(/^(\d+)/);
-  return modern ? modern[1] : null;
-}
-
 function main() {
   const argv = process.argv.slice(2);
   let projectDir = process.cwd();
-  let outPath = null;
   for (let i = 0; i < argv.length; i++) {
-    if (argv[i] === "--out") outPath = argv[++i];
-    else if (!argv[i].startsWith("--")) projectDir = resolve(argv[i]);
+    if (!argv[i].startsWith("--")) projectDir = resolve(argv[i]);
   }
   projectDir = resolve(projectDir);
-  if (!outPath) outPath = join(projectDir, "tmp", "upgrade-prereqs.json");
+  const outPath = process.env.UPGRADE_PREREQS_FILE || join(projectDir, "tmp", "upgrade-prereqs.json");
 
   const result = {
+    ok: false,          // true when errors[] is empty (set in emit)
     projectDir,
     inAppDir: false,
     pomExists: false,
@@ -65,8 +58,6 @@ function main() {
     parentDeclared: false,
     parentFound: false,
     parentPath: null,
-    javaHome: process.env.JAVA_HOME || null,
-    javaVersion: null,
     cliPresent: false,
     dxPluginPresent: false,
     errors: [],
@@ -74,20 +65,28 @@ function main() {
     notes: [],
   };
 
-  // --- App directory: child pom.xml + mule-artifact.json ---
+  log(`Validating prerequisites in ${projectDir}...`);
+
+  // App directory: child pom.xml + mule-artifact.json.
   const childPomPath = join(projectDir, "pom.xml");
   const artifactPath = join(projectDir, "mule-artifact.json");
   result.pomExists = existsSync(childPomPath);
   result.muleArtifactExists = existsSync(artifactPath);
-  if (!result.pomExists) {
+  if (result.pomExists) {
+    log("✅ pom.xml found");
+  } else {
+    log("❌ pom.xml not found");
     result.errors.push(`pom.xml not found at ${childPomPath}. Run from the Mule application root.`);
   }
-  if (!result.muleArtifactExists) {
+  if (result.muleArtifactExists) {
+    log("✅ mule-artifact.json found");
+  } else {
+    log("❌ mule-artifact.json not found");
     result.errors.push(`mule-artifact.json not found at ${artifactPath}. Run from the Mule application root.`);
   }
   result.inAppDir = result.pomExists && result.muleArtifactExists;
 
-  // --- Parent POM availability (only meaningful if the child POM parsed) ---
+  // Parent POM availability (only if the child POM parsed).
   if (result.pomExists) {
     try {
       const childProject = readPomProject(childPomPath);
@@ -97,62 +96,40 @@ function main() {
         if (parentPath) {
           result.parentFound = true;
           result.parentPath = parentPath;
+          log(`✅ Parent POM found: ${parentPath}`);
         } else {
           result.parentFound = false;
+          log("❌ Parent POM declared but not found locally");
           result.errors.push(
             "Child pom.xml declares a <parent>, but the parent POM was not found " +
-            "locally (workspace or ~/.m2). It is required for version detection and " +
-            "for Phase 2 edits (inherited connector/plugin versions). Ask the user " +
-            "to make the parent POM available locally and re-run. Do NOT download it."
+            "at a local relative path (from <parent><relativePath>, or the default " +
+            "../pom.xml). It is required for version detection and for Phase 2 edits " +
+            "(inherited connector/plugin versions). Ask the user to make the parent " +
+            "POM available locally and re-run. Do NOT download it."
           );
         }
       }
     } catch (e) {
+      log("❌ Failed to parse pom.xml");
       result.errors.push(`Failed to parse pom.xml: ${e.message}`);
     }
   }
 
-  // --- JAVA_HOME + java -version ---
-  // Prefer the JDK that JAVA_HOME points at (that is what the build uses), so
-  // the version we report and enforce is authoritative rather than whatever
-  // `java` happens to be first on PATH.
-  let javaBin = "java";
-  if (!result.javaHome) {
-    result.errors.push("JAVA_HOME is not set. Set it to a JDK 8+ install.");
-  } else {
-    const homeJava = join(result.javaHome, "bin", "java");
-    if (existsSync(homeJava)) {
-      javaBin = homeJava;
-    } else {
-      result.errors.push(
-        `JAVA_HOME is set to ${result.javaHome}, but ${homeJava} does not exist. ` +
-        "Point JAVA_HOME at a valid JDK 8+ install."
-      );
-    }
-  }
-  const java = tryExec(javaBin, ["-version"]);
-  if (java.ok || java.out) {
-    result.javaVersion = parseJavaVersion(java.out);
-  }
-  if (!result.javaVersion) {
-    result.errors.push("`java -version` did not report a usable Java version. Ensure a JDK is on PATH / JAVA_HOME.");
-  } else if (Number(result.javaVersion) < 8) {
-    result.errors.push(
-      `Java ${result.javaVersion} is below the minimum supported version (JDK 8+). ` +
-      "Install and point JAVA_HOME at JDK 8 or newer."
-    );
-  }
-
-  // --- Anypoint CLI v4 + DX plugin ---
+  // Anypoint CLI v4 + DX plugin.
   const cli = tryExec("anypoint-cli-v4", ["--version"]);
   result.cliPresent = cli.ok;
   if (!cli.ok) {
+    log("❌ anypoint-cli-v4 not found");
     result.errors.push("anypoint-cli-v4 not found. Install: npm install -g @mulesoft/anypoint-cli-v4");
   } else {
+    log("✅ anypoint-cli-v4 found");
     const dx = tryExec("anypoint-cli-v4", ["dx", "--help"]);
     result.dxPluginPresent = dx.ok;
     if (!dx.ok) {
+      log("❌ DX plugin not found");
       result.errors.push("DX plugin not found. Install: npm install -g @salesforce/anypoint-cli-dx-mule-plugin");
+    } else {
+      log("✅ DX plugin found");
     }
   }
 
@@ -160,15 +137,21 @@ function main() {
 }
 
 function emit(result, outPath) {
+  result.ok = result.errors.length === 0;
   try {
     mkdirSync(dirname(outPath), { recursive: true });
     writeFileSync(outPath, JSON.stringify(result, null, 2));
     result.outPath = outPath;
+    log(`Saved to ${outPath}`);
   } catch (e) {
     result.warnings.push(`Failed to write ${outPath}: ${e.message}`);
+    log(`⚠️  Failed to write ${outPath}: ${e.message}`);
   }
-  process.stdout.write(JSON.stringify(result, null, 2) + "\n");
-  if (result.errors.length > 0) process.exitCode = 1;
+  if (result.errors.length > 0) {
+    log("\nPrerequisite check FAILED. Resolve these before continuing:");
+    for (const err of result.errors) log(`  • ${err}`);
+    process.exitCode = 1;
+  }
   return result;
 }
 

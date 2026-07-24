@@ -1,22 +1,22 @@
-// pom.mjs — shared POM/XML helpers for the upgrade-mule-app detection scripts.
 //
-// Extracted so the parser, property resolution, and parent-POM location logic
-// live in one place instead of being copy-pasted across
-// detect_current_mule_version.mjs, detect_current_java_version.mjs, and
-// validate_prerequisites.mjs. A bug fix to parent resolution should be a
-// single edit, not three.
+// Copyright (c) 2026, Salesforce, Inc.
+// All rights reserved.
+// For full license text, see the LICENSE.txt file
+//
+// Part of upgrade-mule-app skill.
+//
+// Shared POM/XML helpers — tolerant XML parser, ${...} property resolution, and
+// parent-POM location. Imported by the detect_* and validate_prerequisites
+// scripts; not invoked directly.
 
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 
 export const PROP_REF = /^\$\{([^}]+)\}$/;
 
-// ---------------------------------------------------------------------------
-// Minimal, tolerant XML parser -> node tree { name, attrs, children, text }.
-// Handles elements, attributes, comments, CDATA, self-closing tags, and
-// namespace prefixes (the prefix is stripped so "mule:muleVersion" ->
-// "muleVersion"). This is not a general XML validator; it is enough for POMs.
-// ---------------------------------------------------------------------------
+// Minimal tolerant XML parser -> tree { name, attrs, children, text }. Handles
+// elements, attributes, comments, CDATA, self-closing tags, and namespace
+// prefixes (stripped: "mule:muleVersion" -> "muleVersion"). POM-only, not a validator.
 export function parseXml(xml) {
   xml = xml
     .replace(/<\?[\s\S]*?\?>/g, "")
@@ -125,6 +125,12 @@ export function resolveValue(raw, mergedProps, seen = new Set()) {
 
 // Locate the parent pom.xml on disk via <parent><relativePath> or ../pom.xml.
 // Returns the absolute path, or null if there is no <parent> / it is not found.
+//
+// A candidate is only accepted when its own coordinates match the child's
+// declared <parent> groupId/artifactId. This prevents a coincidental ../pom.xml
+// (a Mule app nested under an unrelated Maven directory) from being mistaken for
+// the real parent — which would resolve app.runtime / inherited versions from the
+// wrong POM.
 export function findParentPomPath(childProject, childPomPath) {
   const parent = child(childProject, "parent");
   if (!parent) return null;
@@ -135,6 +141,9 @@ export function findParentPomPath(childProject, childPomPath) {
     child(parent, "relativePath") !== undefined && relRaw === "";
   if (relIsExplicitlyEmpty) return null;
 
+  const wantGroupId = textOf(child(parent, "groupId"));
+  const wantArtifactId = textOf(child(parent, "artifactId"));
+
   const candidates = [];
   if (relRaw) {
     const p = resolve(childDir, relRaw);
@@ -142,9 +151,31 @@ export function findParentPomPath(childProject, childPomPath) {
   }
   candidates.push(resolve(childDir, "..", "pom.xml"));
   for (const c of candidates) {
-    if (existsSync(c) && c.endsWith(".xml")) return c;
+    if (existsSync(c) && c.endsWith(".xml") && matchesParentIdentity(c, wantGroupId, wantArtifactId)) {
+      return c;
+    }
   }
   return null;
+}
+
+// Does the POM at `pomPath` identify as the declared parent? Compares artifactId
+// (always required) and groupId (a POM may inherit its groupId from ITS own
+// parent, so fall back to that). Returns false on any parse failure — an
+// unreadable candidate is treated as "not the parent" and the caller prompts.
+function matchesParentIdentity(pomPath, wantGroupId, wantArtifactId) {
+  if (!wantArtifactId) return false; // malformed <parent>; cannot verify
+  try {
+    const project = readPomProject(pomPath);
+    const gotArtifactId = textOf(child(project, "artifactId"));
+    if (gotArtifactId !== wantArtifactId) return false;
+    if (!wantGroupId) return true; // artifactId matched and nothing else to check
+    const gotGroupId =
+      textOf(child(project, "groupId")) ||
+      textOf(child(child(project, "parent"), "groupId"));
+    return gotGroupId === wantGroupId;
+  } catch {
+    return false;
+  }
 }
 
 // Convenience: parse a POM file from disk into its <project> node.
