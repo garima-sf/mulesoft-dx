@@ -85,6 +85,8 @@ Phase 2 MUST NOT start until Step 12's approval gate has been passed explicitly.
 - **One mvn invocation per response.** When re-running a build after a fix, emit only the `mvn` command in that response. Do not bundle it with further edits, follow-up shell commands, or the completion signal.
 - **"Completion" means the build already passed.** You may only declare completion after a response that ran `mvn clean package` came back with `BUILD SUCCESS` and `mvn test` came back with all tests passing.
 - **Version resolution from scripts/CLI only.** All versions come from scripts or CLI commands, never hardcoded. Use Exchange CLI for connector versions. Use release notes/CLI for plugin versions. Never paste versions from memory or documentation.
+- **Java 17+ REQUIRED for every `describe_connector.sh` call.** Under Java 8 or 11 the Anypoint CLI's `dx mule describe-connector` still exits 0 but returns a DEGRADED response — `configs[]` collapse to `{name, connectionProviders: []}` with no `parameters` / `attributes`, silently hiding required-attribute breaking changes. The skill's Phase-C diff then signs off on a config that is actually broken, and `mvn` fails at `process-classes` with an XSD-validation error (`cvc-complex-type.4: Attribute 'X' must appear on element '<prefix>:<config>'`). Before invoking `describe_connector.sh` (Mode-A/B/C) in Steps 5, 7, and 14, export a Java 17+ `JAVA_HOME` (Zulu 17 preferred on SFDC laptops for Nexus TLS — see Step 13). The script itself refuses to run under < Java 17 and exits with a fix-it message, so a stale `JAVA_HOME` is caught immediately, not seven steps later at packaging.
+- **Skip Phase C for no-change connectors.** After Step 5 (Mode-A) plus the OLD-vs-NEW summary diff, if a connector's diff shows NO operation renames, NO attribute changes, NO element renames, NO error-type shifts, and NO namespace URI/prefix rename, do NOT run Mode-B or Mode-C for it. Emit exactly one line to the run log — `"<nick>: no rewrite needed"` — and move on. Do not enumerate per-op JSONs, do not print stability diffs, do not describe what stayed the same. This is a token-economy rule: full Mode-B/C fan-out on a stable connector is pure noise and doubles the plan-phase cost. The plan output for these connectors should read `<nick>: version bump only, no rewrites` under Step 7's summary section.
 
 ---
 
@@ -179,6 +181,13 @@ Both are already written into `tmp/upgrade-targets.json` by Step 2. Do NOT re-pr
 
 **Note on v1 ordering:** Step 6 runs first (Exchange-metadata walker for Java-17 picks). This step then does the Mode-A **summary describe** on the version each connector was pinned to in Step 6.
 
+**Java 17+ REQUIRED before invoking `describe_connector.sh`.** Export a Java 17 `JAVA_HOME` for the shell that runs this step (see Step 13 for the preferred install — Zulu 17 on SFDC laptops). The script hard-refuses to run under Java 8/11 because those JDKs return a degraded describe (empty `configs[].parameters`) that would silently miss required-attribute breaking changes. If Step 1's `mule-dev-env.json` reported `java_version < 17`, refresh it now:
+
+```bash
+export JAVA_HOME="$(/usr/libexec/java_home -v 17)"   # or your Zulu 17 install
+<skill-dir>/../build-mule-integration/scripts/validate_prerequisites.sh
+```
+
 For each connector nickname `<nick>` in `tmp/upgrade-targets.json`:
 
 ```bash
@@ -245,6 +254,18 @@ Do NOT proceed to Step 7 until every connector has a `tmp/connector-choices/<nic
 ## Step 7: Check Operations/Configs/Error Types Changes
 
 See `references/plan-connector-upgrades.md` §2–§5 (Mode-A summary, usage enumeration, Mode-B per-op, Mode-C per-config-provider).
+
+**Prerequisite: Java 17+.** Same rule as Step 5 — `describe_connector.sh` refuses to run under < Java 17. Verify `$JAVA_HOME` still points at your Java-17 JDK before Mode-B / Mode-C fan-out; a subshell or `cd` may have reset it.
+
+**No-change short-circuit (BEFORE Mode-B / Mode-C).** For each connector, compute an OLD-vs-NEW summary diff from the Mode-A JSONs (`<nick>.json` vs `<nick>-new.json` in `tmp/connector-metadata/`) plus the `errorTypes[]` intersection. If ALL of the following are true, the connector has no rewrites and Mode-B / Mode-C MUST be skipped:
+
+- `.operations[].name` set is identical (no adds/removes/renames used by this app)
+- `.configs[].name` set is identical
+- `.errorTypes[]` set is identical (no error-type map needed)
+- `.namespace.prefix` and `.namespace.namespace` are identical (no XSD rewire)
+- `.operations[<op>].attributes[]` names are identical for every op in `usage.operations_used`
+
+Emit exactly one line to the run log: `<nick>: no rewrite needed`. Do NOT fan out per-op Mode-B, do NOT fan out per-config Mode-C, do NOT print stability diffs. The plan's per-connector section should read `<nick>: version bump only, no rewrites`. This is a token-economy rule (rule from `feedback_upgrade_java17_defaults` #2): stable connectors dominate real upgrades — running full Mode-B/C on a version bump with zero rewrites is pure noise. Run Mode-B / Mode-C ONLY for connectors that fail the short-circuit above.
 
 **Before invoking Mode-B**, intersect `usage.operations_used[]` with `<nick>-new.json .operations[]`:
 
@@ -403,9 +424,10 @@ for nick in $(jq -r '.connectors[].nick' tmp/upgrade-targets.json); do
 done
 ```
 
-Then re-describe each pinned connector so downstream validators use the NEW error catalog:
+Then re-describe each pinned connector so downstream validators use the NEW error catalog. **Java 17+ REQUIRED here too** — same reason as Steps 5 and 7 (`describe_connector.sh` will refuse under Java 8/11). Since Step 13 already gated on Java 17, `$JAVA_HOME` should still be set, but verify before the loop:
 
 ```bash
+java -version 2>&1 | head -1   # must report 17+ before the describe loop
 for nick in $(jq -r '.connectors[].nick' tmp/upgrade-targets.json); do
   <skill-dir>/scripts/describe_connector.sh "$nick"          # no -new suffix
 done

@@ -66,6 +66,47 @@
 #   1  missing/partial args / missing GAV file / CLI failure
 set -euo pipefail
 
+# --- Java 17+ gate --------------------------------------------------------
+# `anypoint-cli-v4 dx mule describe-connector` MUST run under a Java 17+
+# JDK. Under Java 8 or 11 the CLI still exits 0 but returns a DEGRADED
+# describe: config-provider entries collapse to `{name, connectionProviders: []}`
+# with no `parameters` / `attributes`, hiding required-attribute changes
+# on config elements. The skill's Phase-C diff pass then silently signs
+# off, and mvn's XSD validator fails at `process-classes` with
+# `cvc-complex-type.4: Attribute '...' must appear on element '...'` — a
+# self-inflicted breaking-change miss.
+#
+# Fix: refuse to run under < Java 17. Do NOT silently continue. If the
+# describe genuinely must run under an older JDK (e.g. for reproducing
+# a Java-8 fixture bug), set ALLOW_LEGACY_JAVA_FOR_DESCRIBE=1 to override.
+if [ -z "${ALLOW_LEGACY_JAVA_FOR_DESCRIBE:-}" ]; then
+    if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+        _java_bin="$JAVA_HOME/bin/java"
+    else
+        _java_bin="$(command -v java || true)"
+    fi
+    if [ -z "$_java_bin" ]; then
+        echo "❌ describe_connector.sh: no \`java\` on PATH and JAVA_HOME is unset — Java 17+ is required" >&2
+        exit 1
+    fi
+    # `java -version` prints "openjdk version \"17.0.13\"" (or "1.8.0_442"
+    # for legacy). Extract the leading version token and compare against 17.
+    _java_ver_line="$("$_java_bin" -version 2>&1 | head -1)"
+    _java_major="$(printf '%s' "$_java_ver_line" | sed -E 's/.*version "([0-9]+)(\.([0-9]+))?.*/\1/')"
+    # Handle "1.8" → 8 shape (Java 8 reports "1.8.0_xxx"; 9+ report "17.0.x")
+    if [ "$_java_major" = "1" ]; then
+        _java_major="$(printf '%s' "$_java_ver_line" | sed -E 's/.*version "1\.([0-9]+).*/\1/')"
+    fi
+    if ! printf '%s' "$_java_major" | grep -Eq '^[0-9]+$' || [ "$_java_major" -lt 17 ]; then
+        echo "❌ describe_connector.sh: Java $_java_major detected ($_java_ver_line); Java 17+ is required" >&2
+        echo "   Under Java 8/11 the describe returns a degraded schema (empty configs[].parameters) that hides required-attribute changes." >&2
+        echo "   Fix: export JAVA_HOME=\"\$(/usr/libexec/java_home -v 17)\" (or point at your Zulu-17 install) and re-run." >&2
+        echo "   Override: set ALLOW_LEGACY_JAVA_FOR_DESCRIBE=1 only if you truly need a legacy-JDK describe." >&2
+        exit 1
+    fi
+fi
+# --------------------------------------------------------------------------
+
 usage() {
     echo "Usage: $0 <nickname>" >&2
     echo "       $0 <nickname> --type operation|source --name <name>" >&2
