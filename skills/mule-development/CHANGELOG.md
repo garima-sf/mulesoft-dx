@@ -4,6 +4,13 @@ All notable changes to `@salesforce/mulesoft-vibes-skills` are documented in thi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-07-27
+
+### Changed
+
+- **`upgrade-mule-app`** — bumped to skill v2.0.0. Ported all eight bash scripts (`describe_connector.sh`, `enumerate_usage.sh`, `apply_connector_pin.sh`, `apply_runtime_bump.sh`, `check_java_compatibility.sh`, `get_java17_compatible_connector.sh`, `promote_new_connector_pins.sh`, `verify_metadata_coverage.sh`) and both Python helpers (`_apply_connector_pin.py`, `_apply_runtime_bump.py`) to Node.js (ESM, zero npm deps), matching the convention adopted by the sibling `build-mule-integration` skill upstream (mulesoft/mulesoft-dx#147). Shared helpers live under `upgrade-mule-app/lib/*.mjs` (`anypoint.mjs`, `fsx.mjs`, `platform.mjs`, `pom-edit.mjs`, `xml-flow.mjs`). Behaviour is preserved 1:1: identical CLI flags, tmp-file layout, JSON schemas, exit codes, and stderr copy. The pre-2.0.0 originals are retained (unmodified) under `upgrade-mule-app/scripts/archive/` for parity reference and rollback and are NOT invoked by the skill runtime. The structural rewrite of `enumerate_usage` (D-1) lands as a follow-up commit on top of `enumerate_usage.mjs`.
+- **`package.json`** — added `*/lib/**` to the `files` array so the new `upgrade-mule-app/lib/*.mjs` helpers (and any future skill's `lib/`) ship in the published tarball.
+
 ## [1.6.0] - 2026-07-02
 
 ### Added
