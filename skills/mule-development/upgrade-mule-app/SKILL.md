@@ -60,7 +60,15 @@ This skill ships small bash scripts under `scripts/`. Invoke them with the `Bash
 
 | Script | Purpose | Output location |
 | --- | --- | --- |
-| (To be added as scripts are implemented) | | |
+| `describe_connector.sh` | Mode-A/B/C describe of a NEW connector version (summary, per-op, per-config-provider). Invocations (flags — not positional): Mode-A `<nick>-new`; Mode-B `<nick>-new --type operation --name <op>` (or `--type source --name <src>`); Mode-C `<nick>-new --type connection-provider --name <provider> --config-name <config>`. See `references/plan-connector-upgrades.md §2, §4, §5`. | `tmp/connector-metadata/<nick>-new.json`, `<nick>-new-<op>.json`, `<nick>-new-<config>-<provider>.json` |
+| `enumerate_usage.sh` | Scans `src/main/mule/**/*.xml` for a connector's ops, configs, error types, namespace prefix used by the app. The OLD-side source of truth — replaces re-describing the old connector version. See `references/plan-connector-upgrades.md §3`. | `tmp/connector-usage/<nick>.json` |
+| `get_java17_compatible_connector.sh` | Walks Exchange latest→oldest (max 5 versions) for a `(groupId, artifactId)`; first `is-java-17-supported=true` wins. See `references/plan-connector-upgrades.md §1.5`. | `tmp/connector-choices/<nick>-new.json` |
+| `check_java_compatibility.sh` | Probes a connector version's `supportedJavaVersions`. Empty metadata → assume Java-17 OK (`feedback_upgrade_java17_defaults`). | stdout `pass` / `warn` / `block` |
+| `apply_connector_pin.sh` | Bumps one connector's version in `pom.xml` and rewrites its `xsi:schemaLocation` in every flow XML. Deterministic — never hand-edit `xsi:schemaLocation`. | mutates `pom.xml` + `src/main/mule/**/*.xml` |
+| `apply_runtime_bump.sh` | Bumps `<app.runtime>`, `<javaVersion>`, `<maven.compiler.source/target>`, `<mule.maven.plugin.version>` in `pom.xml`, and `minMuleVersion` + `javaSpecificationVersions` in `mule-artifact.json`. Matrix in `references/runtime-bump-matrix.md`. Exits 2 if running Java doesn't match the target. | mutates `pom.xml` + `mule-artifact.json` (+ `.mvn/jvm.config` on Java 17) |
+| `promote_new_connector_pins.sh` | Copies every `tmp/connector-choices/<nick>-new.json` → `tmp/connector-versions/<nick>.json` so Phase 2's pin script can consume them. Run once, before `apply_connector_pin.sh`. | `tmp/connector-versions/<nick>.json` |
+| `verify_metadata_coverage.sh` | Step 11.5 gate — for every op / source / provider in `tmp/connector-usage/*.json`, verify a Mode-B / Mode-C JSON exists in `tmp/connector-metadata/`. Exits 1 with FAIL rows when any required per-op / per-provider describe is missing. Configs whose Mode-A `.connectionProviders[]` is empty (D7 fallback — some DB configs) emit INFO and do not fail; Phase C reads Mode-A `.configs[]` directly for those. Optional `--strict` also fails on WARN rows (renamed / removed ops that lack a `<nick>-op-renames.json` entry). | stdout FAIL/WARN/INFO rows |
+| `_apply_connector_pin.py`, `_apply_runtime_bump.py` | Internal Python helpers invoked by the two `apply_*.sh` wrappers. Do not call directly from the agent. | — |
 
 Invoke scripts by the absolute path you were given in the "skill is now active" message (it is the directory containing this `SKILL.md`). Do **not** construct relative paths like `../scripts/...` — Cline's working directory shifts across turns and relative paths have produced "No such file or directory" errors in real runs. The inline step examples below write `scripts/...` as shorthand; substitute `<skill-dir>/scripts/...` when you actually execute them.
 
@@ -86,7 +94,7 @@ Phase 2 MUST NOT start until Step 12's approval gate has been passed explicitly.
 - **"Completion" means the build already passed.** You may only declare completion after a response that ran `mvn clean package` came back with `BUILD SUCCESS` and `mvn test` came back with all tests passing.
 - **Version resolution from scripts/CLI only.** All versions come from scripts or CLI commands, never hardcoded. Use Exchange CLI for connector versions. Use release notes/CLI for plugin versions. Never paste versions from memory or documentation.
 - **Java 17+ REQUIRED for every `describe_connector.sh` call.** Under Java 8 or 11 the Anypoint CLI's `dx mule describe-connector` still exits 0 but returns a DEGRADED response — `configs[]` collapse to `{name, connectionProviders: []}` with no `parameters` / `attributes`, silently hiding required-attribute breaking changes. The skill's Phase-C diff then signs off on a config that is actually broken, and `mvn` fails at `process-classes` with an XSD-validation error (`cvc-complex-type.4: Attribute 'X' must appear on element '<prefix>:<config>'`). Before invoking `describe_connector.sh` (Mode-A/B/C) in Steps 5, 7, and 14, export a Java 17+ `JAVA_HOME` (Zulu 17 preferred on SFDC laptops for Nexus TLS — see Step 13). The script itself refuses to run under < Java 17 and exits with a fix-it message, so a stale `JAVA_HOME` is caught immediately, not seven steps later at packaging.
-- **Skip Phase C for no-change connectors.** After Step 5 (Mode-A) plus the OLD-vs-NEW summary diff, if a connector's diff shows NO operation renames, NO attribute changes, NO element renames, NO error-type shifts, and NO namespace URI/prefix rename, do NOT run Mode-B or Mode-C for it. Emit exactly one line to the run log — `"<nick>: no rewrite needed"` — and move on. Do not enumerate per-op JSONs, do not print stability diffs, do not describe what stayed the same. This is a token-economy rule: full Mode-B/C fan-out on a stable connector is pure noise and doubles the plan-phase cost. The plan output for these connectors should read `<nick>: version bump only, no rewrites` under Step 7's summary section.
+- **`not_in_use` skip — the ONLY pre-Mode-B/C skip.** If Step 7's `enumerate_usage.sh` prints a `not_in_use` JSON on stdout, the connector is declared in `pom.xml` but has zero flow usage. Reduce the plan for that connector to "bump the pom version only — no flow edits, no per-op describe." Skip Mode-B and Mode-C, but keep the connector in the plan under a `pom-only` section so Phase 2 still runs `apply_connector_pin.sh`. Do NOT invent any other "stable connector" short-circuit — for every connector with real usage, run Mode-B / Mode-C unconditionally and let Step 12's plan synthesis surface "no rewrites" naturally by finding zero per-symbol diffs against the Mode-B / Mode-C JSONs.
 
 ---
 
@@ -200,6 +208,10 @@ Verify `tmp/connector-metadata/<nick>-new.json` exists before proceeding, and th
 
 Writes `tmp/connector-metadata/<nick>-new.json` — the top-level summary (operations, sources, configs, errorTypes, supportedJavaVersions). This is the input to Step 7's Mode-B (per-op) and Mode-C (per-config-provider) describes.
 
+**Mode-A ≠ Mode-B — do NOT grep Mode-A for attribute names.** The summary lists `.operations[].name` and `.configs[].name` only; it does NOT carry `.operations[<op>].attributes[]` or `.childElements[]`. Attribute renames, required-attribute additions, and attribute→child promotions are only visible in Mode-B (`<nick>-new-<op>.json`). Building the plan's per-op attribute diff off Mode-A will silently miss XSD-breaking changes — the build then fails at `process-classes` with `cvc-complex-type.3.2.2` errors that could have been caught at plan time. If Step 7 needs an attribute, run Mode-B for that op.
+
+**Describe is NEW-only.** Do NOT describe the OLD connector version — the OLD-side source of truth is `enumerate_usage.sh` (flow XML scan) in Step 7, not a second describe. Pre-4.6-era connectors often fail to describe under a Java-17 JDK; the skill is designed to work without OLD describe. See `feedback_upgrade_describe_new_only`.
+
 Full algorithm and JSON shape: `references/plan-connector-upgrades.md §2 (Mode-A summary describe)`.
 
 - Scan app JAR for Mule and Java compatibility
@@ -257,20 +269,80 @@ See `references/plan-connector-upgrades.md` §2–§5 (Mode-A summary, usage enu
 
 **Prerequisite: Java 17+.** Same rule as Step 5 — `describe_connector.sh` refuses to run under < Java 17. Verify `$JAVA_HOME` still points at your Java-17 JDK before Mode-B / Mode-C fan-out; a subshell or `cd` may have reset it.
 
-**No-change short-circuit (BEFORE Mode-B / Mode-C).** For each connector, compute an OLD-vs-NEW summary diff from the Mode-A JSONs (`<nick>.json` vs `<nick>-new.json` in `tmp/connector-metadata/`) plus the `errorTypes[]` intersection. If ALL of the following are true, the connector has no rewrites and Mode-B / Mode-C MUST be skipped:
-
-- `.operations[].name` set is identical (no adds/removes/renames used by this app)
-- `.configs[].name` set is identical
-- `.errorTypes[]` set is identical (no error-type map needed)
-- `.namespace.prefix` and `.namespace.namespace` are identical (no XSD rewire)
-- `.operations[<op>].attributes[]` names are identical for every op in `usage.operations_used`
-
-Emit exactly one line to the run log: `<nick>: no rewrite needed`. Do NOT fan out per-op Mode-B, do NOT fan out per-config Mode-C, do NOT print stability diffs. The plan's per-connector section should read `<nick>: version bump only, no rewrites`. This is a token-economy rule (rule from `feedback_upgrade_java17_defaults` #2): stable connectors dominate real upgrades — running full Mode-B/C on a version bump with zero rewrites is pure noise. Run Mode-B / Mode-C ONLY for connectors that fail the short-circuit above.
+**`not_in_use` skip contract.** If `enumerate_usage.sh` returns a `not_in_use` JSON for a connector (declared in `pom.xml` but zero flow usage), skip Mode-B and Mode-C for that connector. Keep it in the plan under a `pom-only` section so Phase 2 still runs the pin script. Do NOT invent any other pre-Mode-B/C short-circuit — for every connector with real usage, run Mode-B / Mode-C unconditionally; the "no rewrites" verdict falls out of Step 12's plan synthesis when the per-symbol diffs against Mode-B / Mode-C JSONs come back empty.
 
 **Before invoking Mode-B**, intersect `usage.operations_used[]` with `<nick>-new.json .operations[]`:
 
 - Op present in `.operations[]` → run Mode-B on it.
 - Op **absent** from `.operations[]` → the op was renamed or removed. Pick the closest rename candidate (Levenshtein-close or same semantic role — e.g. S3 8.x: `createObject` → `putObject`, `readObject` → `getObject`) and run Mode-B on the **candidate**. Log the guessed rename in `tmp/connector-metadata/<nick>-op-renames.json` so §7's plan enumerates it explicitly. Never silently skip an op — the flow XML still calls it.
+
+**Concrete invocations — flag-based, not positional.** The bundled scripts table (top of file) lists the syntax; repeat here so a subagent doesn't have to scroll:
+
+```bash
+# Mode-B — per operation or source
+<skill-dir>/scripts/describe_connector.sh <nick>-new --type operation --name <op>
+<skill-dir>/scripts/describe_connector.sh <nick>-new --type source    --name <src>
+
+# Mode-C — per config-provider (both --name and --config-name are required)
+<skill-dir>/scripts/describe_connector.sh <nick>-new --type connection-provider --name <provider> --config-name <config>
+```
+
+Passing operation names as positional args (`describe_connector.sh <nick>-new <op>`) is NOT supported and will trigger a "missing/partial args" exit — a real run in July 2026 burned 2–4 tool calls trial-and-erroring the flag order.
+
+**Mandatory fan-out loop — one Mode-B per op, one Mode-C per provider, NO exceptions.** Do not "sample one op per connector" — every op / source / provider in `tmp/connector-usage/<nick>.json` MUST have its own describe file before Step 11.5. Skipping the fan-out leaves Step 12 blind on attribute renames and required-attribute additions; Step 16's retry loop then burns its whole budget guessing.
+
+Execute the fan-out for every connector via this loop (paste verbatim — do not re-implement it inline). It is idempotent — an existing `<nick>-new-<op>.json` is skipped, so re-running after a partial run is cheap:
+
+```bash
+for usage in tmp/connector-usage/*.json; do
+    nick="$(basename "$usage" .json)"
+    status="$(jq -r '.status // ""' "$usage")"
+    [ "$status" = "not_in_use" ] && continue
+
+    modeA="tmp/connector-metadata/${nick}-new.json"
+    [ -f "$modeA" ] || { echo "❌ Mode-A missing for $nick — re-run Step 5"; exit 1; }
+
+    # Mode-B per operation (intersect with Mode-A .operations[])
+    for op in $(jq -r '.operations_used[]? // empty' "$usage"); do
+        known="$(jq -r --arg n "$op" '[.operations[]? | if type == "string" then . else .name end] | index($n) // "none"' "$modeA")"
+        if [ "$known" = "none" ]; then
+            echo "⚠️  $nick/$op — op absent from Mode-A .operations[] (rename/removed); Step 12 must consult <nick>-op-renames.json"
+            continue
+        fi
+        out="tmp/connector-metadata/${nick}-new-${op}.json"
+        [ -f "$out" ] && continue
+        <skill-dir>/scripts/describe_connector.sh "${nick}-new" --type operation --name "$op"
+    done
+
+    # Mode-B per source
+    for src in $(jq -r '.sources_used[]? // empty' "$usage"); do
+        out="tmp/connector-metadata/${nick}-new-${src}.json"
+        [ -f "$out" ] && continue
+        <skill-dir>/scripts/describe_connector.sh "${nick}-new" --type source --name "$src"
+    done
+
+    # Mode-C per (config, provider). Skip pairs where Mode-A .configs[<cfg>].connectionProviders[] is empty — D7 fallback.
+    for cfg in $(jq -r '.configs_used[]? // empty' "$usage"); do
+        declared="$(jq -c --arg c "$cfg" '[.configs[]? | select((.elementName // .name) == $c) | .connectionProviders[]? | if type == "string" then . else (.elementName // .name) end]' "$modeA")"
+        [ "$(jq 'length' <<<"$declared")" = "0" ] && continue
+        for prov in $(jq -r '.config_providers_used[]? // empty' "$usage"); do
+            declared_hit="$(jq -r --arg n "$prov" 'index($n) // "none"' <<<"$declared")"
+            [ "$declared_hit" = "none" ] && continue
+            out="tmp/connector-metadata/${nick}-new-${cfg}-${prov}.json"
+            [ -f "$out" ] && continue
+            <skill-dir>/scripts/describe_connector.sh "${nick}-new" --type connection-provider --name "$prov" --config-name "$cfg"
+        done
+    done
+done
+```
+
+**Post-condition (self-check) — must pass before Step 7 declares "done".** Do not defer this to Step 11.5:
+
+```bash
+<skill-dir>/scripts/verify_metadata_coverage.sh || { echo "❌ Mode-B/C fan-out incomplete — re-run the loop above until coverage passes"; exit 1; }
+```
+
+If `verify_metadata_coverage.sh` prints FAIL rows, re-run the fan-out loop for just those `(nick, op)` / `(nick, cfg, prov)` pairs. The loop is idempotent — it only re-invokes describe when the target file is missing.
 
 **After Mode-B / Mode-C complete**, run the mandatory diffs listed in §8 (`references/plan-connector-upgrades.md`):
 
@@ -310,7 +382,20 @@ Sources to read:
 - Every `<ee:transform>` block under `src/main/mule/**/*.xml`
 - Every inline `#[...]` expression under `src/main/mule/**/*.xml`
 
-Java-17 coercion hot spots (`as Number`, `now() as String`, `error.errorType.identifier`) are checked opportunistically during the same read pass — no separate scan.
+**Java 17 upgrade patterns — check every DW file (inline + `.dwl` under `src/main/resources/**`) for these eight, and add each hit to the plan under "DataWeave downstream impact":**
+
+1. **`as Number` / `as Integer` on external strings** — Java 17's `NumberFormat` rejects thousands separators and whitespace that Java 8 tolerated. Wrap with a `sanitizeNumeric()` helper (strip `,` and trim) before the cast.
+2. **`sizeOf(x as Object)` / `keysOf(x as Object)` / any `as Object` on a Map or Array** — the `as Object` cast used to opaque-wrap the value; Java 17 + newer DW rejects it. Drop the cast.
+3. **`now() + <Number>` / `<DateTime> + <Number>`** — implicit Number→Period coercion is gone. Convert to an explicit period literal, e.g. `now() + |P7D|` or `now() + |PT1H|`.
+4. **`formatDate(x, pattern)` / `parseDate(s, pattern)` without `{locale: ...}`** — JEP 252 flipped the default locale provider to CLDR; month/day names drift. Add `{locale: "en-US"}` (or the app's canonical locale) explicitly.
+5. **Hardcoded reliance on `Charset.defaultCharset()`** or reading/writing files without an explicit charset — JEP 400 flipped the JVM default to UTF-8. Pin the charset explicitly on every read/write.
+6. **`dw::Runtime::run(..., engine: "javascript")` or any Nashorn callout** — JEP 372 removed Nashorn. Rewrite in native DW (`reduce`, `map`, etc.); if the logic genuinely needs a JVM callout, use `java!` and audit that path against pattern 7.
+7. **`java!` prefix into `sun.*` / `jdk.internal.*` / any encapsulated JDK internals** — JEP 403 hard-blocks reflective access to JDK internals. Rewrite using DataWeave native representations (locale as `{language, country}` map, timezone as canonical ID string).
+8. **Three-letter timezone identifiers** (`"PST"`, `"CST"`, `"EST"`, `"PST8PDT"`) — tzdb drift + ambiguous mappings. Replace with canonical IANA IDs (`"America/Los_Angeles"`, `"America/Chicago"`, `"America/New_York"`).
+
+The model already knows the fix for each pattern from public Java-17 migration guides — you don't need a bundled scanner script. Read each DW source with the `Read` tool, apply the checklist inline, and record every hit as `file:line — pattern-N — proposed fix` in Step 12's plan.
+
+The connector-specific coercion checks (`as Number` on a connector op's payload, `now() as String` for a connector attribute, `error.errorType.identifier` against Mode-B error catalog) also happen during this same read pass — no separate scan.
 
 Findings roll into the plan's "DataWeave downstream impact" section (see `references/plan-connector-upgrades.md §7`).
 
@@ -347,20 +432,47 @@ Findings roll into the plan's "MUnit downstream impact" section (see `references
 
 ---
 
+## Step 11.5: Verify Metadata Coverage (gate)
+
+Run the coverage gate before touching Step 12. It cross-references every op / source / provider in `tmp/connector-usage/*.json` against the Mode-A / Mode-B / Mode-C JSONs on disk and refuses to advance the plan if any required describe is missing.
+
+```bash
+<skill-dir>/scripts/verify_metadata_coverage.sh
+```
+
+Behavior:
+
+- **FAIL** (exit 1) — a required Mode-B or Mode-C JSON is missing on disk for an op/provider that IS present in Mode-A. Re-run `describe_connector.sh` for those (op, provider) pairs, then re-run this gate.
+- **WARN** — an op/provider appears in `usage_sites` but is NOT in Mode-A `.operations[]` / `.configs[].connectionProviders[]`. Usually a rename or removal; Step 7 should have written `<nick>-op-renames.json` with the candidate. Non-fatal by default — pass `--strict` to fail on WARN rows too.
+- **INFO** — the connector is `not_in_use`, OR a used config has zero declared providers in Mode-A (D7 fallback). Phase C consumes Mode-A `.configs[]` directly for the empty-provider case; no Mode-C is required.
+
+Do not proceed to Step 12 until this gate exits 0. A blind plan built on a missing per-op describe silently ships a "no rewrites needed" verdict for whatever the missing JSON would have revealed.
+
+---
+
 ## Step 12: Present Plan & Get Approval
 
 See `references/plan-connector-upgrades.md` §7 (plan synthesis, approval gate) and §8 (Phase-C completeness checklist — run before user is asked to approve).
 
 Concrete flow for this step:
 
-1. Verify §8 completeness checklist first — every connector has a `-new.json`, every used op has a `-new-<op>.json`, every used (config, provider) pair has a `-new-<config>-<provider>.json`. If any artifact is missing, loop back to Step 5/6/7 and do not present a partial plan.
-2. `Read` the file `tmp/upgrade-plan.md` produced by §7.
-3. Print its full contents inline in the response as fenced markdown so the user can review without opening another file.
-4. Use `AskUserQuestion` with three options:
+1. Verify §8 completeness checklist first — every connector has a `-new.json`, every used op has a `-new-<op>.json`, every used (config, provider) pair has a `-new-<config>-<provider>.json`. Step 11.5's `verify_metadata_coverage.sh` gate already ran the mechanical version of this check; if it exited 0 you are safe to proceed. If any artifact is missing, loop back to Step 5/6/7 and do not present a partial plan.
+2. **Resolve renames from the data you already have — do not defer to Step 16.** Every WARN row emitted by Step 11.5 is a rename signal (`WARN <nick>/<op-or-provider> — not in Mode-A ...`). For each WARN:
+   - **Op renames**: cross-reference `tmp/connector-metadata/<nick>-new.json` `.operations[]` (all new op names). Pick the semantically closest match to the old op name and confirm by reading its Mode-B `tmp/connector-metadata/<nick>-new-<newOp>.json` `.attributes[]` — does the new op accept the attributes the flow XML sets on the old element? If yes, encode the rewrite as a plan bullet: `Rewrite <ns>:<oldOp> → <ns>:<newOp>` with attribute deltas listed inline (renamed, removed, newly-required).
+   - **Provider renames**: cross-reference Mode-A `.configs[].connectionProviders[]` (all new provider names for that config) and read the Mode-C describe `tmp/connector-metadata/<nick>-new-<config>-<newProvider>.json` for each candidate. Pick the new provider whose attributes best cover what the flow XML sets on the old provider element (grep the flow XML: `grep -c 'ns:oldProvider' src/main/mule/*.xml` and then list its attributes). Emit `Rewrite <ns>:<oldProvider> → <ns>:<newProvider>` with attribute deltas.
+   - The LLM already has every input needed — old names (from `tmp/connector-usage/<nick>.json` `.config_providers_used[]` / `.operations_used[]`), new names (from Mode-A `.operations[]` / Mode-A `.configs[].connectionProviders[]`), and per-target attribute shape (from Mode-B / Mode-C JSONs). No new script, no new AskUserQuestion — just synthesize the rename bullets into `tmp/upgrade-plan.md` before presenting it. Halt via `AskUserQuestion` only if a match is genuinely ambiguous (2+ new candidates with equal attribute coverage).
+   - **Required-attribute additions** — beyond renames, diff each used op / provider / config's Mode-B/Mode-C `.attributes[]` where `required: true` against the attributes actually set on the corresponding element in flow XML. For every new-required attribute not present in the current flow XML:
+     - If `.default` is set → emit `Add <ns>:<element> @<attr>="<default>"` (Example: crypto 2.x `<crypto:jce-config>` now requires `type` with `.default = "JCEKS"` → plan bullet `Add crypto:jce-config @type="JCEKS"`).
+     - Else if `.type == "enum"` → pick `.values[0]` and note it in the bullet as `(picked first enum value; verify)`.
+     - Else → surface as an `AskUserQuestion` bullet (`Connector <nick> op/provider <name> requires new attribute <attr> (<type>) — please supply a value`) before finalizing the plan.
+   - This catches the "XSD says attribute X is required and you didn't set it" class of failure at plan time using Mode-B/C data you already fetched, instead of letting Step 16 burn retries reverse-engineering enum values from mvn error text.
+3. `Read` the file `tmp/upgrade-plan.md` produced by §7 (with rename bullets from step 2 folded in).
+4. Print its full contents inline in the response as fenced markdown so the user can review without opening another file.
+5. Use `AskUserQuestion` with three options:
    - `Yes, proceed to Execution`
    - `No, I want to change the plan`
    - `No, cancel the upgrade`
-5. **WAIT for the explicit "Yes, proceed to Execution."** before advancing to Step 13.
+6. **WAIT for the explicit "Yes, proceed to Execution."** before advancing to Step 13.
 
 On `No, change`: collect specifics via a follow-up `AskUserQuestion`, loop back to the affected step (5/6/7/9/10), re-synthesize the plan, re-present. Do NOT rerun Step 1.
 
@@ -461,9 +573,52 @@ Use metadata from `describe-connector` to ensure operations, configs, and attrib
 
 See `references/execute-connector-upgrades.md` §4 (bounded 3-retry recovery loop). Note: `mvn clean package` BUILD SUCCESS is packaging-only — Step 17 (`mvn test`) is the real gate.
 
-- Run `mvn clean package -DskipTests`
-- If build fails, parse errors and fix remaining issues
-- Repeat until build succeeds
+- Run `mvn clean package -DskipTests 2>&1 | tee tmp/mvn-failures/build-<attempt>.log`
+- If BUILD SUCCESS → advance to Step 17.
+- If BUILD FAILURE → classify the error (`references/execute-connector-upgrades.md §4` — attribute-rename, element-rename, provider-element, enum-value). Apply the fix. Retry.
+
+### Diagnostic escalation ladder — MANDATORY on opaque failures
+
+A "guess-fix-retry" loop that only reads the terse mvn line burns retries when the error message doesn't point at the offending file. Two failure modes are especially opaque and MUST trigger an escalation probe **before** the next code edit — not after a wasted retry.
+
+**Trigger A — XSD "invalid content" on a pinned connector's operation/element.**
+Symptom: `cvc-complex-type.2.4.a: Invalid content was found starting with element '<ns>:<op>'`.
+Meaning: the flow XML calls an op that the *resolved* XSD doesn't declare. The pom pin may not have taken effect (stale local repo, transitive pin from parent POM, `current/` alias resolving to old version).
+
+Before editing anything, run:
+```bash
+mvn dependency:tree -Dincludes=<groupId>:<artifactId> 2>&1 | tail -20
+```
+- If the resolved version ≠ the pinned version → `rm -rf ~/.m2/repository/<groupPath>/<artifactId>/<staleVer>` then re-run `mvn ... -U`.
+- If versions match → the operation was genuinely renamed. Re-read the connector's Mode-B / `<nick>-op-renames.json` and apply the rename to the flow XML.
+
+**Trigger B — opaque `ClassCastException` / `NullPointerException` with no app file in the stack.**
+Symptom: `java.lang.ClassCastException: class java.lang.String cannot be cast to class java.lang.Integer` (or similar) and the stack trace lives entirely inside `org.mule.runtime.*` / `com.mulesoft.*` classes — no file/line in `src/main/mule/`.
+
+Before editing anything, re-run with debug and grep for the failure frame + bean context:
+```bash
+mvn clean package -DskipTests -X 2>&1 | grep -B 20 -A 3 'ClassCastException\|NullPointerException' \
+  | tee tmp/mvn-failures/build-<attempt>-debug.log
+```
+Then scan the preceding 20 lines for `Creating bean` / `parsing element` / `BeanDefinition` — those name the flow-XML element being constructed (e.g. `db:pooling-profile`, `http:listener-connection`). That element is where the fix lives. Common cause: a `${property}` placeholder on an attribute the new connector version now types as `xs:int`/`xs:boolean` — quote-strip or wrap in `${int(...)}` per the Mode-B `.attributes[].type`.
+
+**Both probes are cheap (single mvn invocation, no code changes) and MUST run before the third retry** — otherwise the loop hits its 3-retry cap while still guessing.
+
+**Trigger C — XSD error on an element/attribute that the plan already anticipated.**
+Symptom, either:
+- `cvc-complex-type.2.4.a: Invalid content ... element '<ns>:<name>'` AND grep shows `Rewrite <ns>:<name> →` in `tmp/upgrade-plan.md`; OR
+- `cvc-complex-type.4: Attribute '<attr>' must appear on element '<ns>:<name>'` AND grep shows `Add <ns>:<name> @<attr>=` in `tmp/upgrade-plan.md`.
+
+Do NOT re-analyze from XSD error text and do NOT guess an enum value. `grep -A2 "Rewrite <ns>:<name>\|Add <ns>:<name>" tmp/upgrade-plan.md` for the target directive, then apply that edit verbatim. The plan was written with Mode-B/C metadata already in hand (Step 12 sub-step 2) — trust it. If the plan bullet is missing but the WARN was present in Step 11.5 (or the attribute was declared `required: true` in the Mode-B/C JSON), that's a Step 12 skip; loop back to Step 12 and re-synthesize the plan (do not paper over it with a guess in Step 16).
+
+### Retry cap and halt
+
+- Retry budget: **3 build failures max** (log-and-diagnostic pass counts as ½ retry — see §4).
+- If BUILD FAILURE persists after 3 real edit-retries with both escalation probes run, HALT via `AskUserQuestion` with:
+  1. First 30 lines of the last three `tmp/mvn-failures/build-<N>.log`
+  2. Dependency-tree excerpt (Trigger A) or debug stack frame (Trigger B), whichever ran
+  3. Classifications applied per retry
+  4. 2–4 candidate next actions (typically: pin a different connector version, revert one flow-XML edit, request a Mode-C describe of the failing config)
 
 ---
 
