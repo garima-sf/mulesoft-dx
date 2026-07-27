@@ -5,7 +5,6 @@
 // kebab→camel conversion, prefix-fallback rules, and attribute filters.
 // D-1 (structural rewrite) lands after this port; this module stays regex.
 import { readFileSync, readdirSync } from 'node:fs';
-import path from 'node:path';
 
 /** @param {string} s @returns {string} Regex-escaped literal. */
 export function escapeRegExp(s) {
@@ -29,8 +28,12 @@ export function kebabToCamel(s) {
 }
 
 /**
- * @param {string} flowDir Absolute path to `src/main/mule`.
- * @returns {string[]} Sorted list of absolute paths to `*.xml` files.
+ * @param {string} flowDir Path to `src/main/mule` (relative or absolute).
+ * @returns {string[]} Sorted list of `*.xml` file paths. Uses string
+ *   concatenation (not `path.join`) so the caller's `./` prefix is
+ *   preserved verbatim in the emitted paths — matching the pre-2.0.0
+ *   bash shell-glob `"$FLOW_DIR"/*.xml` behaviour that the usage-site
+ *   JSON schema depends on.
  */
 export function listFlowFiles(flowDir) {
   let entries;
@@ -39,10 +42,11 @@ export function listFlowFiles(flowDir) {
   } catch {
     return [];
   }
+  const sep = flowDir.endsWith('/') ? '' : '/';
   return entries
     .filter((f) => f.endsWith('.xml'))
     .sort()
-    .map((f) => path.join(flowDir, f));
+    .map((f) => `${flowDir}${sep}${f}`);
 }
 
 /** @param {string} p @returns {string} File contents; empty on any read error. */

@@ -97,7 +97,7 @@ if (window.length === 0) {
   };
 }
 
-stdout.write(JSON.stringify(verdict) + '\n');
+stdout.write(JSON.stringify(verdict, null, 2) + '\n');
 
 if (verdict.status === 'block') exit(2);
 exit(0);

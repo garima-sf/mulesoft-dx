@@ -95,7 +95,10 @@ if (!newMeta) {
 
 // -- flow dir + files -------------------------------------------------------
 
-const FLOW_DIR = path.join(PROJECT_DIR, 'src/main/mule');
+// String concat (not path.join) — the caller's PROJECT_DIR (typically ".")
+// must survive into FLOW_DIR unchanged so the emitted usage-site file paths
+// match the pre-2.0.0 bash "$FLOW_DIR"/*.xml shell-glob shape (`./src/...`).
+const FLOW_DIR = `${PROJECT_DIR.replace(/\/$/, '')}/src/main/mule`;
 if (!isDir(FLOW_DIR)) {
   stderr.write(`❌ no flow directory at ${FLOW_DIR}\n`);
   exit(1);
