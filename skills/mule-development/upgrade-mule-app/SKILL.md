@@ -34,7 +34,6 @@ Upgrade Mule applications with automated version updates and end-to-end compatib
 ```bash
 anypoint-cli-v4 --version
 anypoint-cli-v4 dx --help
-echo $JAVA_HOME && java -version   # Java 8+
 anypoint-cli-v4 conf
 ```
 
@@ -65,7 +64,7 @@ This skill ships small scripts under `scripts/`. Invoke them with the `Bash` too
 | `scripts/validate_prerequisites.mjs` | Step 1 — validate app directory (`pom.xml` + `mule-artifact.json`), parent-POM availability (if referenced), Anypoint CLI v4, DX plugin. Validation-ONLY; exits non-zero when `errors[]` is non-empty | `tmp/upgrade-prereqs.json` (contains `inAppDir`, `parentDeclared`, `parentFound`, `cliPresent`, `dxPluginPresent`, `errors[]`, ...) |
 | `scripts/detect_current_mule_version.mjs` | Step 2a — determine the current Mule Runtime version from the `app.runtime` property (child, then parent `pom.xml`), and flag versions below the supported floor (4.4) | `tmp/current-mule-version.json` (contains `version`, `source`, `resolvedFrom`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
 | `scripts/detect_current_java_version.mjs` | Step 2b — determine the current Java version from `mule-artifact.json` `javaSpecificationVersions`, and flag versions below the supported floor (8) | `tmp/current-java-version.json` (contains `version`, `source`, `supportedVersions`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
-| `scripts/resolve_jdk.mjs` | Step 3 & Phase 2 — ensure a JDK for a given Java **major** is available and report a usable `JAVA_HOME`. Resolves major → full build string (e.g. `8` → `8.0.472_8`) via `dx mule runtime list` (matrix-file fallback), reuses an already-installed JDK (`$JAVA_HOME` or the Anypoint Code Builder java dir), and downloads only when none is present. MAY download (network) unless `--no-download` | `tmp/resolve-jdk-<major>.json` (contains `major`, `requestedBuild`, `javaHome`, `javaBin`, `source`, `downloaded`, `available`, `errors[]`, ...) |
+| `scripts/resolve_jdk.mjs` | Step 3 & Phase 2 — ensure a JDK for a given Java **major** is available and report a usable `JAVA_HOME`. Resolves major → full build string (e.g. `8` → `8.0.472_8`) via `dx mule runtime list` (matrix-file fallback), reuses an already-installed JDK under the Anypoint Code Builder java dir, and downloads only when none is present. MAY download (network) unless `--no-download` | `tmp/resolve-jdk-<major>.json` (contains `major`, `requestedBuild`, `javaHome`, `javaBin`, `source`, `downloaded`, `available`, `errors[]`, ...) |
 | `scripts/resolve_target_versions.mjs` | Step 4 — determine the recommended upgrade target (in-channel: highest minor, latest patch, latest non-EOL Java) from the current versions + live `dx mule runtime list`, and validate a user-requested target (`TARGET_MULE`/`TARGET_JAVA`) against the locked policy. Advisory — always exits 0; caller branches on fields | `tmp/target-versions.json` (contains `currentMule`, `currentJava`, `channel`, `options[]`, `requestedTarget` {`accepted`, `mule`, `java`, `reasonCode`, `reason`, `crossChannel`, `warning`, `belowRecommended`, `note`}, `requestedJavaOnly` {`java`, `supported`, `supportedJavas[]`, `recommendedMule`, `recommendedJava`, `note`}, `nothingToUpgrade`, `needsUserPrompt`, `warnings[]`, ...) |
 | `scripts/_pom_utils.mjs` | Shared library — tolerant XML parser, `${...}` property resolution, and parent-POM location (with parent-identity verification) used by the detection/validation scripts above. Not invoked directly | (imported) |
 
@@ -184,7 +183,7 @@ node scripts/resolve_jdk.mjs <current-java-major> .
 
 It writes `tmp/resolve-jdk-<major>.json`. Read it and branch:
 
-- **`available: true`** → use `javaHome` for the build. It may have come from `$JAVA_HOME`, an already-installed JDK, or a fresh download (`source` / `downloaded` say which).
+- **`available: true`** → use `javaHome` for the build. It may have come from an already-installed JDK under the Anypoint Code Builder java dir, or a fresh download (`source` / `downloaded` say which).
 - **`errors[]` non-empty (exit 1)** → STOP and surface the errors. Common cause: no JDK of that major installed and no build string resolvable (CLI/DX plugin missing or not authenticated).
 
 This is the same helper Phase 2 uses for the target Java — run it once per Java version needed.
@@ -457,8 +456,6 @@ Present final summary:
 ---
 
 ## Troubleshooting
-
-**JAVA_HOME not set:** `export JAVA_HOME=$(/usr/libexec/java_home -v 11)`
 
 **anypoint-cli-v4 not found:** `npm install -g @mulesoft/anypoint-cli-v4`
 

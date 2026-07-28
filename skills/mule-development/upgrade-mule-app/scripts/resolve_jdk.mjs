@@ -9,9 +9,9 @@
 // Ensure a JDK for a given Java MAJOR version is available locally, and report a
 // usable JAVA_HOME. Shared by Step 3 (build baseline on the app's CURRENT Java)
 // and Phase 2 (build on the TARGET Java). Resolves major -> full JDK build string
-// (e.g. 8 -> 8.0.472_8) via `anypoint-cli-v4 dx mule runtime list`, 
-// locates an already-installed JDK under $JAVA_HOME or the
-// Anypoint Code Builder java dir, and only downloads when none is present.
+// (e.g. 8 -> 8.0.472_8) via `anypoint-cli-v4 dx mule runtime list`,
+// locates an already-installed JDK under the Anypoint Code Builder java dir
+// (~/AnypointCodeBuilder/java), and only downloads when none is present.
 //
 // Usage:
 //   node resolve_jdk.mjs <major> [projectDir] [--no-download]
@@ -48,17 +48,6 @@ function tryExec(cmd, args) {
   if (r.error) return { ok: false, out: "", status: null, error: r.error.message };
   const combined = `${r.stdout || ""}${r.stderr || ""}`;
   return { ok: r.status === 0, out: combined, status: r.status };
-}
-
-// java -version prints e.g. version "1.8.0_402" or "17.0.13" -> major "8"/"17".
-function parseJavaMajor(text) {
-  if (!text) return null;
-  const m = text.match(/version\s+"([^"]+)"/i);
-  if (!m) return null;
-  const legacy = m[1].match(/^1\.(\d+)/);
-  if (legacy) return legacy[1];
-  const modern = m[1].match(/^(\d+)/);
-  return modern ? modern[1] : null;
 }
 
 // A JDK build string may arrive as 17.0.13_11 (API/flag) or 17.0.13+11 (dir name).
@@ -141,16 +130,6 @@ function javaHomeUnder(root) {
   return null;
 }
 
-// Does the JDK at javaHome report the requested major?
-function javaHomeSatisfies(javaHome, major) {
-  const home = javaHomeUnder(javaHome) || javaHome;
-  const bin = join(home, "bin", process.platform === "win32" ? "java.exe" : "java");
-  if (!existsSync(bin)) return null;
-  const v = tryExec(bin, ["-version"]);
-  const got = parseJavaMajor(v.out);
-  return got === String(major) ? home : null;
-}
-
 // Look for an installed JDK of the given major under the ACB java dir. Match by
 // major (any build of that major is usable for a build); prefer an exact build
 // match when we know the requested build string.
@@ -210,7 +189,7 @@ function main() {
     requestedBuild: null,
     javaHome: null,
     javaBin: null,
-    source: null,        // where javaHome came from: env | acb-dir | download
+    source: null,        // where javaHome came from: acb-dir | download
     buildSource: null,   // where the build string came from: runtime-list-cli
     downloaded: false,
     available: false,
@@ -237,17 +216,7 @@ function main() {
     );
   }
 
-  // 2a. Does the current JAVA_HOME already satisfy the requested major?
-  if (process.env.JAVA_HOME) {
-    const home = javaHomeSatisfies(process.env.JAVA_HOME, major);
-    if (home) {
-      result.javaHome = home;
-      result.source = "env";
-      result.notes.push(`$JAVA_HOME already provides Java ${major}.`);
-    }
-  }
-
-  // 2b. Is a JDK of that major already installed under the ACB java dir?
+  // 2. Is a JDK of that major already installed under the ACB java dir?
   if (!result.javaHome) {
     const home = findInAcbJavaDir(major, result.requestedBuild);
     if (home) {
