@@ -66,8 +66,7 @@ This skill ships small scripts under `scripts/`. Invoke them with the `Bash` too
 | `scripts/detect_current_mule_version.mjs` | Step 2a — determine the current Mule Runtime version from the `app.runtime` property (child, then parent `pom.xml`), and flag versions below the supported floor (4.4) | `tmp/current-mule-version.json` (contains `version`, `source`, `resolvedFrom`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
 | `scripts/detect_current_java_version.mjs` | Step 2b — determine the current Java version from `mule-artifact.json` `javaSpecificationVersions`, and flag versions below the supported floor (8) | `tmp/current-java-version.json` (contains `version`, `source`, `supportedVersions`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
 | `scripts/resolve_jdk.mjs` | Step 3 & Phase 2 — ensure a JDK for a given Java **major** is available and report a usable `JAVA_HOME`. Resolves major → full build string (e.g. `8` → `8.0.472_8`) via `dx mule runtime list` (matrix-file fallback), reuses an already-installed JDK (`$JAVA_HOME` or the Anypoint Code Builder java dir), and downloads only when none is present. MAY download (network) unless `--no-download` | `tmp/resolve-jdk-<major>.json` (contains `major`, `requestedBuild`, `javaHome`, `javaBin`, `source`, `downloaded`, `available`, `errors[]`, ...) |
-| `scripts/resolve_target_versions.mjs` | Step 4 — determine the recommended upgrade target (in-channel: highest minor, latest patch, latest non-EOL Java) from the current versions + live `dx mule runtime list`, and validate a user-requested target (`TARGET_MULE`/`TARGET_JAVA`) against the locked policy. Advisory — always exits 0; caller branches on fields | `tmp/target-versions.json` (contains `currentMule`, `currentJava`, `channel`, `options[]`, `requestedTarget` {`accepted`, `mule`, `java`, `reasonCode`, `reason`, `crossChannel`, `warning`}, `nothingToUpgrade`, `needsUserPrompt`, `warnings[]`, ...) |
-| `scripts/test_resolve_target_versions.mjs` | Test-only — runs the target-selection policy against a stubbed runtime list (no app, no CLI, no network) and asserts the recommendation + requested-target rules. Run with `node scripts/test_resolve_target_versions.mjs`; exits non-zero on any failure | (stdout pass/fail; no persisted output) |
+| `scripts/resolve_target_versions.mjs` | Step 4 — determine the recommended upgrade target (in-channel: highest minor, latest patch, latest non-EOL Java) from the current versions + live `dx mule runtime list`, and validate a user-requested target (`TARGET_MULE`/`TARGET_JAVA`) against the locked policy. Advisory — always exits 0; caller branches on fields | `tmp/target-versions.json` (contains `currentMule`, `currentJava`, `channel`, `options[]`, `requestedTarget` {`accepted`, `mule`, `java`, `reasonCode`, `reason`, `crossChannel`, `warning`, `belowRecommended`, `note`}, `requestedJavaOnly` {`java`, `supported`, `supportedJavas[]`, `recommendedMule`, `recommendedJava`, `note`}, `nothingToUpgrade`, `needsUserPrompt`, `warnings[]`, ...) |
 | `scripts/_pom_utils.mjs` | Shared library — tolerant XML parser, `${...}` property resolution, and parent-POM location (with parent-identity verification) used by the detection/validation scripts above. Not invoked directly | (imported) |
 
 Invoke scripts by the absolute path you were given in the "skill is now active" message (it is the directory containing this `SKILL.md`). Do **not** construct relative paths like `../scripts/...` — Cline's working directory shifts across turns and relative paths have produced "No such file or directory" errors in real runs. The inline step examples below write `scripts/...` as shorthand; substitute `<skill-dir>/scripts/...` when you actually execute them.
@@ -217,6 +216,19 @@ node scripts/resolve_target_versions.mjs .
 TARGET_MULE=4.11 node scripts/resolve_target_versions.mjs .
 ```
 
+**A target is a Mule version.** `TARGET_MULE` is what defines a requested target — only pass it when the user named a specific Mule runtime. Do **not** set `TARGET_MULE` to the current version to express "keep Mule"; that would be read as a downgrade/no-op and refused.
+
+A **bare Java mention** ("upgrade my app to Java 17/11/8/21") is not a separate target — the recommendation always moves Java to the latest non-EOL Java as part of the Mule upgrade. Pass the Java they named via `TARGET_JAVA` alone (no `TARGET_MULE`) so the script can check it against what the recommended runtime supports:
+
+```bash
+# User mentioned only a Java version (e.g. "upgrade to Java 17"):
+TARGET_JAVA=17 node scripts/resolve_target_versions.mjs .
+```
+
+Then always present `options[0]` (the Mule + Java path), and read `requestedJavaOnly`:
+- **`requestedJavaOnly: null`** → the Java they named is the one we recommend (or they named none). Just present the recommendation; no extra message.
+- **`requestedJavaOnly` set** → the named Java is EOL (8/11) or unsupported by the recommended runtime (e.g. 21). Present the recommendation **and** surface `requestedJavaOnly.note` verbatim — it states their Java isn't a supported target and names the Java we do support.
+
 It writes `tmp/target-versions.json`. Read fields with `jq` and branch:
 
 - **`needsUserPrompt: true`** → the script could not settle on a target (no current versions, or the runtime list could not be fetched). Inspect `warnings`: a fetch failure means the CLI is not authenticated (`anypoint-cli-v4 conf`) or offline — surface it and re-run. Do not invent versions.
@@ -240,7 +252,13 @@ When the user asks for a target other than the recommendation, re-run the script
   - `eol-java` — target keeps/selects EOL Java (8/11); the skill exists to move apps off EOL Java.
   - `unsupported-combo` — the target Mule does not support the requested Java.
   - `unknown-version` — the requested Mule is not in the runtime list.
-- **`accepted: true` and `crossChannel: false`** → in-channel target (including a valid intermediate like 4.4→4.6, or 4.4→latest-LTS). Proceed with `requestedTarget.mule` / `requestedTarget.java`.
+- **`accepted: true` and `crossChannel: false`** → in-channel target (including a valid intermediate like 4.4→4.6, or 4.4→latest-LTS). Show **both** the recommendation and their validated target, then let the user pick — unless their request already equals `options[0]` (same Mule + Java), in which case there is no choice to make and you proceed directly:
+
+  > Recommended: **Mule {options[0].mule}, Java {options[0].java}**. Your requested target: **Mule {requestedTarget.mule}, Java {requestedTarget.java}**
+  >
+  > Which do you want to proceed with?
+
+  When `requestedTarget.belowRecommended: true` (their valid target is lower than the latest in-channel runtime), surface `requestedTarget.note` verbatim alongside the choice — it states their target isn't the latest and names the one we recommend. Proceed with whichever the user confirms (`requestedTarget.mule` / `requestedTarget.java` if they keep their choice, else `options[0]`).
 - **`accepted: true` and `crossChannel: true`** → the target switches support channels (LTS↔Edge). This is **allowed, but you MUST warn first.** Surface `requestedTarget.warning` verbatim and get explicit confirmation before proceeding:
 
   > ⚠️ {requestedTarget.warning}

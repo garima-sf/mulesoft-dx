@@ -24,11 +24,25 @@
 //   * Java target is always the latest non-EOL Java (Java 8 and 11 are EOL /
 //     discouraged and are NEVER an upgrade target). We do not offer a
 //     "keep Java 8/11" path — every Mule upgrade also moves Java to 17.
-//   * Java-only upgrades are NOT supported yet (revisit when Java 25 ships).
+//   * There is NO standalone Java-only upgrade path (revisit when Java 25 ships).
+//     A bare Java mention is not a distinct target — see TARGET_JAVA below.
 //   * Intermediate minors (e.g. 4.4 -> 4.6) are NOT recommended by default; the
 //     agent only pursues one if the user explicitly asks.
 //   * Already on the highest minor's latest patch AND latest Java -> nothing to
 //     upgrade.
+//
+// User-requested targets (env TARGET_MULE / TARGET_JAVA) are validated alongside
+// the recommendation, never instead of it:
+//   * TARGET_MULE named -> validateRequestedTarget(): refuse a downgrade/same
+//     version, an EOL target Java, an unsupported Mule+Java combo, or a version
+//     not in the runtime list (only a bare minor resolves to its latest patch).
+//     An accepted cross-channel switch (LTS<->Edge) is flagged crossChannel +
+//     warning; an accepted in-channel target below the latest is flagged
+//     belowRecommended + note.
+//   * TARGET_JAVA only (no TARGET_MULE) -> NOT a distinct target. We still show
+//     the recommendation (it already moves Java to the latest non-EOL). If the
+//     named Java isn't the one we'd land on (EOL 8/11, or unsupported like 21),
+//     buildRequestedJavaOnly() attaches a note pointing at what we support.
 //
 // Data sources:
 //   * Runtime list + compatibleJDKs — LIVE via `anypoint-cli-v4 dx mule runtime
@@ -42,11 +56,16 @@
 //   Reads current versions from <projectDir>/tmp/current-mule-version.json and
 //   current-java-version.json (Step 2 output), unless overridden by env:
 //     CURRENT_MULE=4.6.32 CURRENT_JAVA=8   (for testing all scenarios)
+//   Optionally set TARGET_MULE / TARGET_JAVA to validate a user-requested target.
 //   Output path: ${TARGET_VERSIONS_FILE} when set, else
 //   <projectDir>/tmp/target-versions.json.
 //
 // Output JSON (file): { currentMule, currentJava, currentMinor, channel,
-//   target: { mule, java, kind, muleChanged, javaChanged, note } | null,
+//   options: [ { kind, mule, java, muleChanged, javaChanged, patchOnly, note } ],
+//   requestedTarget: { accepted, mule, java, reasonCode, reason, crossChannel,
+//     warning, belowRecommended, note } | null,
+//   requestedJavaOnly: { java, supported, supportedJavas, recommendedMule,
+//     recommendedJava, note } | null,
 //   nothingToUpgrade, runtimeSource, needsUserPrompt, warnings[], notes[] }.
 //
 // Exit code:
@@ -111,6 +130,20 @@ function channelOfMinor(minor) {
 // --- data source -----------------------------------------------------------
 
 function loadRuntimes(result) {
+  // Test-only override: a stubbed runtime list injected via RUNTIME_LIST_JSON
+  // lets the harness assert the policy deterministically with no CLI/network.
+  // Never set in production — the live CLI below is the sole real source.
+  if (process.env.RUNTIME_LIST_JSON) {
+    try {
+      const json = JSON.parse(process.env.RUNTIME_LIST_JSON);
+      if (Array.isArray(json) && json.length) {
+        result.runtimeSource = "runtime-list-env-stub";
+        return json;
+      }
+    } catch (e) {
+      result.warnings.push(`RUNTIME_LIST_JSON set but not valid JSON (${e.message.split("\n")[0]}).`);
+    }
+  }
   // Live CLI is the sole source of truth for runtime versions + compatibleJDKs.
   // No bundled fallback — if the call fails, we stop and let the agent surface
   // it rather than reason from stale cached data.
@@ -179,8 +212,16 @@ function main() {
     // user explicitly asks.
     options: [],
     // Set only when the user explicitly requested a specific target
-    // (TARGET_MULE): { accepted, mule, java, reasonCode, reason }.
+    // (TARGET_MULE): { accepted, mule, java, reasonCode, reason, crossChannel,
+    // warning, belowRecommended, note }. When accepted && crossChannel, the agent
+    // MUST surface `warning` (channel switch) before proceeding; when accepted &&
+    // belowRecommended, surface `note` (target is valid but not the latest).
     requestedTarget: null,
+    // Set when the user named ONLY a Java (TARGET_JAVA, no TARGET_MULE) that
+    // differs from the recommended one: { java, supported, supportedJavas[],
+    // recommendedMule, recommendedJava, note }. Lets the agent tell the user their
+    // Java (EOL 8/11, or unsupported like 21) isn't a target and show what we support.
+    requestedJavaOnly: null,
     nothingToUpgrade: false,
     runtimeSource: null,
     needsUserPrompt: false,
@@ -210,11 +251,13 @@ function main() {
   //   - target Java must be non-EOL (never keep/select Java 8/11).
   //   - target Mule must support the target Java (buildable combo).
   //   - if no target Java given, pair with the target Mule's latest non-EOL Java.
+  // Only validate a requested target when a Mule version is named. A Java-only
+  // mention (TARGET_JAVA, no TARGET_MULE) is handled after the recommendation
+  // below, since the recommendation already moves Java to the latest non-EOL.
   const reqMule = process.env.TARGET_MULE || null;
+  const reqJava = process.env.TARGET_JAVA || null;
   if (reqMule) {
-    result.requestedTarget = validateRequestedTarget(
-      reqMule, process.env.TARGET_JAVA || null, mule, runtimes
-    );
+    result.requestedTarget = validateRequestedTarget(reqMule, reqJava, mule, runtimes);
   }
 
   // Out-of-matrix guard: if the current minor isn't represented at all, we have
@@ -224,7 +267,7 @@ function main() {
   if (!knownMinors.has(result.currentMinor) && !currentIsLegacy) {
     result.needsUserPrompt = true;
     result.warnings.push(
-      `Current Mule minor ${result.currentMinor} is not in the runtime list; ` +
+      `Current Mule minor ${result.currentMinor} is not in the supported runtimes list; ` +
       `no compatibility data to recommend a target. Ask the user how to proceed.`
     );
     return emit(result, outPath);
@@ -274,6 +317,9 @@ function main() {
     result.notes.push(
       `Already on the latest ${result.channel} runtime (${targetMule}) and Java ${targetJava}.`
     );
+    // Even with nothing to upgrade, if the user named an unsupported Java we
+    // still tell them what we support (never silently drop the mention).
+    result.requestedJavaOnly = buildRequestedJavaOnly(reqMule, reqJava, highest, targetMule, targetJava, result.channel);
     return emit(result, outPath);
   }
 
@@ -299,14 +345,35 @@ function main() {
   }
 
   result.options = [option];
+
+  // If the user's accepted target is lower than the recommendation (e.g. an
+  // in-channel intermediate 4.4->4.6 when 4.9 is the latest), flag that it isn't
+  // the latest so the agent can show both and let the user choose.
+  const rt = result.requestedTarget;
+  if (rt && rt.accepted && !rt.crossChannel && compareVersions(rt.mule, targetMule) < 0) {
+    rt.belowRecommended = true;
+    rt.note =
+      `Mule ${rt.mule} is a valid target but not the latest ${result.channel} ` +
+      `runtime. We recommend Mule ${targetMule} on Java ${targetJava}.`;
+  }
+
+  result.requestedJavaOnly = buildRequestedJavaOnly(reqMule, reqJava, highest, targetMule, targetJava, result.channel);
+
   return emit(result, outPath);
 }
 
-// Find the runtime-list entry matching a requested Mule version. Accepts an
-// exact version (4.9.19) or a bare minor (4.9 -> that minor's latest-patch row).
+// Find the runtime-list entry matching a requested Mule version. We only support
+// what the runtime list carries — nothing else:
+//   - Exact version (4.9.19) -> must match a row exactly.
+//   - Bare minor (4.9)       -> that minor's latest-patch row.
+// A full x.y.z that isn't in the list (e.g. 4.9.10) is NOT resolved up to the
+// minor's latest patch — it returns null so the caller refuses it as an unknown
+// version, rather than silently substituting a different patch.
 function findRuntimeForRequest(runtimes, reqMule) {
   const exact = runtimes.find((r) => String(r.version) === String(reqMule));
   if (exact) return exact;
+  // Only a bare minor (exactly major.minor, no patch) falls back to latest patch.
+  if (!/^\d+\.\d+$/.test(String(reqMule).trim())) return null;
   const wantMinor = minorOf(reqMule);
   const ofMinor = runtimes
     .filter((r) => minorOf(r.version) === wantMinor)
@@ -315,14 +382,18 @@ function findRuntimeForRequest(runtimes, reqMule) {
 }
 
 // Validate a user-requested target against the locked policy. Returns
-// { accepted, mule, java, reasonCode, reason }. reasonCode is one of:
-//   downgrade | eol-java | unsupported-combo | unknown-version.
+// { accepted, mule, java, reasonCode, reason, crossChannel, warning }.
+// reasonCode is one of: downgrade | eol-java | unsupported-combo |
+// unknown-version. `crossChannel` is true when an ACCEPTED target switches
+// support channels (LTS<->Edge); `warning` then carries the message the agent
+// must surface before proceeding (PM-confirmed: allow cross-channel upgrades,
+// but warn). Recommendation stays in-channel regardless.
 function validateRequestedTarget(reqMule, reqJava, currentMule, runtimes) {
   const rt = findRuntimeForRequest(runtimes, reqMule);
   if (!rt) {
     return {
       accepted: false, mule: reqMule, java: reqJava, reasonCode: "unknown-version",
-      reason: `Mule ${reqMule} is not in the runtime list; cannot validate it.`,
+      reason: `Mule ${reqMule} is not in the supported runtimes list; cannot validate it.`,
     };
   }
   const targetMule = rt.version;
@@ -367,12 +438,55 @@ function validateRequestedTarget(reqMule, reqJava, currentMule, runtimes) {
     }
   }
 
-  return { accepted: true, mule: targetMule, java: String(targetJava), reasonCode: null, reason: null };
+  // Accepted. Flag cross-channel switches (LTS<->Edge) so the agent warns the
+  // user before proceeding. Legacy 4.4 is LTS-lineage, so 4.4->LTS is in-channel.
+  const currentChannel = channelOfMinor(minorOf(currentMule));
+  const targetChannel = channelOfMinor(minorOf(targetMule));
+  const crossChannel = currentChannel !== targetChannel;
+  const warning = crossChannel
+    ? `Mule ${targetMule} is on the ${targetChannel} channel, but your app is on ` +
+      `${currentChannel}. This upgrade switches support channels (${currentChannel} → ` +
+      `${targetChannel}). We recommend staying on ${currentChannel}; proceed only if ` +
+      `you intend to change channels.`
+    : null;
+  return {
+    accepted: true, mule: targetMule, java: String(targetJava),
+    reasonCode: null, reason: null, crossChannel, warning,
+  };
 }
 
 // Does a runtime list the given Java spec (EOL or not) in its compatibleJDKs?
 function runtimeSupportsJava(runtime, javaSpec) {
   return (runtime.compatibleJDKs || []).some((j) => javaSpecOf(j) === String(javaSpec));
+}
+
+// Bare Java mention (no Mule named). Not a distinct target — we always show the
+// recommendation; if the named Java isn't what we'd land on (EOL 8/11, or
+// unsupported), point at what we support. Returns null when nothing to flag.
+function buildRequestedJavaOnly(reqMule, reqJava, highest, targetMule, targetJava, channel) {
+  if (reqMule || reqJava == null || String(reqJava) === "" || String(reqJava) === String(targetJava)) {
+    return null;
+  }
+  const supported = supportedJavas(highest);              // non-EOL Javas the rec runtime supports
+  const isEol = DISCOURAGED_JAVA.includes(String(reqJava));
+  // The emit() prefix already names the requested Java ("You asked for Java N."),
+  // so keep the note free of that repetition — just why it's out and what we
+  // recommend instead.
+  const reason = isEol
+    ? `That version is end-of-life.`
+    : `That version isn't supported by any current Mule runtime.`;
+  return {
+    java: String(reqJava),
+    supported: false,
+    supportedJavas: supported,
+    recommendedMule: String(targetMule),
+    recommendedJava: String(targetJava),
+    note:
+      `${reason} We recommend the latest ${channel} runtime: ` +
+      `Mule ${targetMule} on Java ${targetJava}` +
+      (supported.length > 1 ? ` (supports Java ${supported.join(", ")})` : "") +
+      `.`,
+  };
 }
 
 // Non-EOL Java specs a runtime supports, sorted ascending.
@@ -411,6 +525,19 @@ function emit(result, outPath) {
       const patch = o.patchOnly ? " (latest patch)" : "";
       log(`  • ${label}: Mule ${o.mule}, Java ${o.java}${patch}`);
       if (o.note) log(`      ${o.note}`);
+    }
+  }
+  const rj = result.requestedJavaOnly;
+  if (rj) log(`   ⚠️  You asked for Java ${rj.java}. ${rj.note}`);
+  const rt = result.requestedTarget;
+  if (rt) {
+    if (rt.accepted) {
+      log(`Requested target: Mule ${rt.mule}, Java ${rt.java} — ACCEPTED.`);
+      if (rt.crossChannel) log(`   ⚠️  ${rt.warning}`);
+      if (rt.belowRecommended) log(`   ℹ️  ${rt.note}`);
+    } else {
+      log(`Requested target: Mule ${rt.mule}${rt.java ? `, Java ${rt.java}` : ""} — REFUSED (${rt.reasonCode}).`);
+      log(`   ${rt.reason}`);
     }
   }
   for (const w of result.warnings) log(`   • ${w}`);
