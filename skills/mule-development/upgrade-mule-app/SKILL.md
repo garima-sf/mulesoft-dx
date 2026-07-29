@@ -1,11 +1,11 @@
 ---
 name: upgrade-mule-app
-description: Upgrades Java version and/or Mule Runtime, gets latest compatible connector versions, updates connector versions, and fixes impacts from operation changes in flows, DataWeave scripts, and MUnit tests. Supports Java upgrades, Mule Runtime upgrades, or both. Call this skill when users request to upgrade Java version, Mule runtime version, or modernize existing Mule applications.
+description: Workflow required before any Mule application upgrade work. Call use_skill as your FIRST action — before reading project files (pom.xml, mule-artifact.json) or editing versions yourself — whenever the user asks to upgrade, migrate, bump, modernize, or move a Mule app to a newer Java version, a newer Mule Runtime version, or both. Covers upgrading Java and/or Mule Runtime, getting latest compatible connector versions, updating connector and plugin versions, and fixing impacts from operation changes in flows, DataWeave scripts, and MUnit tests. Even a targeted single-version bump like 'move this app to Java 17' or 'upgrade the runtime to 4.6' requires this workflow — do not hand-edit pom.xml versions and attempt the change yourself. When you call this skill, it must be the only tool call in that response.
 license: Apache-2.0
 compatibility: Requires Anypoint CLI v4 with the `@salesforce/anypoint-cli-dx-mule-plugin` DX plugin, Java 8+, Mule Runtime
 metadata:
   author: mule-dx-tooling
-  version: "2.0.0"
+  version: "1.0.0"
   cli: anypoint-cli-v4
   theme: professional
 allowed-tools: Bash Read Write Edit AskUserQuestion
@@ -34,7 +34,6 @@ Upgrade Mule applications with automated version updates and end-to-end compatib
 ```bash
 anypoint-cli-v4 --version
 anypoint-cli-v4 dx --help
-echo $JAVA_HOME && java -version   # Java 8+
 anypoint-cli-v4 conf
 ```
 
@@ -46,6 +45,8 @@ npm install -g @salesforce/anypoint-cli-dx-mule-plugin
 anypoint-cli-v4 conf username <username>
 anypoint-cli-v4 conf password <password>
 ```
+
+**Requires:** Mule Runtime **4.4+** and Java **8+**. Apps below either are not supported, upgrade to the baseline first.
 
 **Required files in project:**
 - `mule-artifact.json` - Mule application metadata
@@ -60,17 +61,23 @@ This skill ships small Node.js (ESM, zero-dep) scripts under `scripts/`. Invoke 
 
 | Script | Purpose | Output location |
 | --- | --- | --- |
+| `scripts/validate_prerequisites.mjs` | Step 1 — validate app directory (`pom.xml` + `mule-artifact.json`), parent-POM availability (if referenced), Anypoint CLI v4, DX plugin. Validation-ONLY; exits non-zero when `errors[]` is non-empty | `tmp/upgrade-prereqs.json` (contains `inAppDir`, `parentDeclared`, `parentFound`, `cliPresent`, `dxPluginPresent`, `errors[]`, ...) |
+| `scripts/detect_current_mule_version.mjs` | Step 2a — determine the current Mule Runtime version from the `app.runtime` property (child, then parent `pom.xml`), and flag versions below the supported floor (4.4) | `tmp/current-mule-version.json` (contains `version`, `source`, `resolvedFrom`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
+| `scripts/detect_current_java_version.mjs` | Step 2b — determine the current Java version from `mule-artifact.json` `javaSpecificationVersions`, and flag versions below the supported floor (8) | `tmp/current-java-version.json` (contains `version`, `source`, `supportedVersions`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
+| `scripts/resolve_jdk.mjs` | Step 3 & Phase 2 — ensure a JDK for a given Java **major** is available and report a usable `JAVA_HOME`. Resolves major → full build string (e.g. `8` → `8.0.472_8`) via `dx mule runtime list` (matrix-file fallback), reuses an already-installed JDK under the Anypoint Code Builder java dir, and downloads only when none is present. MAY download (network) unless `--no-download` | `tmp/resolve-jdk-<major>.json` (contains `major`, `requestedBuild`, `javaHome`, `javaBin`, `source`, `downloaded`, `available`, `errors[]`, ...) |
+| `scripts/resolve_target_versions.mjs` | Step 4 — determine the recommended upgrade target (in-channel: highest minor, latest patch, latest non-EOL Java) from the current versions + live `dx mule runtime list`, and validate a user-requested target (`TARGET_MULE`/`TARGET_JAVA`) against the locked policy. Advisory — always exits 0; caller branches on fields | `tmp/target-versions.json` (contains `currentMule`, `currentJava`, `channel`, `options[]`, `requestedTarget` {`accepted`, `mule`, `java`, `reasonCode`, `reason`, `crossChannel`, `warning`, `belowRecommended`, `note`}, `requestedJavaOnly` {`java`, `supported`, `supportedJavas[]`, `recommendedMule`, `recommendedJava`, `note`}, `nothingToUpgrade`, `needsUserPrompt`, `warnings[]`, ...) |
+| `scripts/_pom_utils.mjs` | Shared library (Steps 1–4) — tolerant XML parser, `${...}` property resolution, and parent-POM location (with parent-identity verification) used by the detection/validation scripts above. Not invoked directly | (imported) |
 | `describe_connector.mjs` | Mode-A/B/C describe of a NEW connector version (summary, per-op, per-config-provider). Invocations (flags — not positional): Mode-A `<nick>-new`; Mode-B `<nick>-new --type operation --name <op>` (or `--type source --name <src>`); Mode-C `<nick>-new --type connection-provider --name <provider> --config-name <config>`. See `references/plan-connector-upgrades.md §2, §4, §5`. | `tmp/connector-metadata/<nick>-new.json`, `<nick>-new-<op>.json`, `<nick>-new-<config>-<provider>.json` |
 | `enumerate_usage_xml.mjs` | **Preferred** usage enumerator — parses `src/main/mule/**/*.xml` with `fast-xml-parser`. Identical output to `enumerate_usage.mjs` but correct on messy input (ignores commented-out elements; binds `config-ref` to its owning element). Exits rc=3 if `fast-xml-parser` isn't importable → caller falls back to the grep script. See Step 7 "Usage enumeration". | `tmp/connector-usage/<nick>.json` |
 | `enumerate_usage.mjs` | Zero-dependency (regex/grep) usage enumerator — the fallback for `enumerate_usage_xml.mjs`. Scans `src/main/mule/**/*.xml` for a connector's ops, configs, error types, namespace prefix used by the app. The OLD-side source of truth — replaces re-describing the old connector version. See `references/plan-connector-upgrades.md §3`. | `tmp/connector-usage/<nick>.json` |
 | `get_java17_compatible_connector.mjs` | Walks Exchange latest→oldest (max 5 versions) for a `(groupId, artifactId)`; first `is-java-17-supported=true` wins. See `references/plan-connector-upgrades.md §1.5`. | `tmp/connector-choices/<nick>-new.json` |
 | `check_java_compatibility.mjs` | Probes a connector version's `supportedJavaVersions`. Empty metadata → assume Java-17 OK (`feedback_upgrade_java17_defaults`). | stdout `pass` / `warn` / `block` |
 | `apply_connector_pin.mjs` | Bumps one connector's version in `pom.xml` and rewrites its `xsi:schemaLocation` in every flow XML. Deterministic — never hand-edit `xsi:schemaLocation`. | mutates `pom.xml` + `src/main/mule/**/*.xml` |
-| `apply_runtime_bump.mjs` | Bumps `<app.runtime>`, `<javaVersion>`, `<maven.compiler.source/target>`, `<mule.maven.plugin.version>` in `pom.xml`, and `minMuleVersion` + `javaSpecificationVersions` in `mule-artifact.json`. Matrix in `references/runtime-bump-matrix.md`. Exits 2 if running Java doesn't match the target. | mutates `pom.xml` + `mule-artifact.json` (+ `.mvn/jvm.config` on Java 17) |
+| `apply_runtime_bump.mjs` | Bumps `<app.runtime>`, `<javaVersion>`, `<maven.compiler.source/target>`, `<mule.maven.plugin.version>` in `pom.xml`, and `minMuleVersion` + `javaSpecificationVersions` in `mule-artifact.json`. Reads targets from `tmp/upgrade-targets.json` (`.mule.to` / `.java.to`). Matrix in `references/runtime-bump-matrix.md`. Exits 2 if running Java doesn't match the target. | mutates `pom.xml` + `mule-artifact.json` (+ `.mvn/jvm.config` on Java 17) |
 | `promote_new_connector_pins.mjs` | Copies every `tmp/connector-choices/<nick>-new.json` → `tmp/connector-versions/<nick>.json` so Phase 2's pin script can consume them. Run once, before `apply_connector_pin.mjs`. | `tmp/connector-versions/<nick>.json` |
 | `verify_metadata_coverage.mjs` | Step 11.5 gate — for every op / source / provider in `tmp/connector-usage/*.json`, verify a Mode-B / Mode-C JSON exists in `tmp/connector-metadata/`. Exits 1 with FAIL rows when any required per-op / per-provider describe is missing. Configs whose Mode-A `.connectionProviders[]` is empty (D7 fallback — some DB configs) emit INFO and do not fail; Phase C reads Mode-A `.configs[]` directly for those. Optional `--strict` also fails on WARN rows (renamed / removed ops that lack a `<nick>-op-renames.json` entry). | stdout FAIL/WARN/INFO rows |
 
-Shared helpers live in `lib/*.mjs` alongside `scripts/`: `anypoint.mjs` (CLI env scrubbing), `fsx.mjs` (I/O), `platform.mjs` (Java version parsing), `pom-edit.mjs` (pom.xml + mule-artifact.json + XSD rewrites), `xml-flow.mjs` (flow XML grep primitives). The pre-2.0.0 bash + Python originals live under `scripts/archive/` for parity reference and rollback; the skill runtime does not invoke them.
+Shared helpers live in `lib/*.mjs` alongside `scripts/`: `anypoint.mjs` (CLI env scrubbing), `fsx.mjs` (I/O), `platform.mjs` (Java version parsing), `pom-edit.mjs` (pom.xml + mule-artifact.json + XSD rewrites), `xml-flow.mjs` (flow XML grep primitives). Steps 1–4's detection/validation scripts share `scripts/_pom_utils.mjs` (tolerant XML + `${...}` + parent-POM location); Steps 5–21's edit scripts use `lib/pom-edit.mjs` — the two POM helpers are independent and both survive. The pre-2.0.0 bash + Python originals live under `scripts/archive/` for parity reference and rollback; the skill runtime does not invoke them.
 
 Invoke scripts by the absolute path you were given in the "skill is now active" message (it is the directory containing this `SKILL.md`). Do **not** construct relative paths like `../scripts/...` — Cline's working directory shifts across turns and relative paths have produced "No such file or directory" errors in real runs. The inline step examples below write `scripts/...` as shorthand; substitute `<skill-dir>/scripts/...` when you actually execute them.
 
@@ -104,98 +111,223 @@ Phase 2 MUST NOT start until Step 12's approval gate has been passed explicitly.
 
 ## Step 1: Validate Prerequisites
 
-Run the sibling `build-mule-integration` prerequisites script — it writes `tmp/mule-dev-env.json` and exits non-zero when Anypoint CLI or a JDK is missing. Reuse rather than reinvent.
+Run the prerequisite validation script. It only validates — it writes nothing to the project and never prompts:
 
 ```bash
-<skill-dir>/../build-mule-integration/scripts/validate_prerequisites.sh
+node scripts/validate_prerequisites.mjs .
 ```
 
-After the script succeeds, confirm the app directory has both `pom.xml` and `mule-artifact.json` (the script does not check for these — it only validates tooling).
+It writes the validation findings to `tmp/upgrade-prereqs.json` (read fields with `jq`, e.g. `jq -r '.parentFound' tmp/upgrade-prereqs.json`). **If the script exits non-zero (i.e. `errors[]` is non-empty), STOP and act on the errors before progressing.** The most common ones:
+
+- **Not in an app directory** (`pom.xml` / `mule-artifact.json` missing) → tell the user to run from the Mule application root.
+- **Parent POM declared but not found locally** (`parentDeclared: true`, `parentFound: false`) → the parent is required both for version detection (Step 2) and for Phase 2 edits (inherited connector/plugin versions, Steps 14/19). Ask the user to make the parent POM available at a local relative path (resolvable from the child's `<parent><relativePath>`, or the default `../pom.xml`) and re-run. **Do not attempt to download it.**
+- **Toolchain missing** (`cliPresent` / `dxPluginPresent` false) → point the user at the install commands in Prerequisites.
+
+Only proceed to Step 2 once the script exits zero.
 
 Do **not** gate on JAVA_HOME pointing at Java 17 here. Step 3 builds the app on its **current** Java (usually 8 or 11); Step 13 is the Java-17 gate.
-
-- User is in app directory
-- App available locally (mule-artifact.json and pom.xml exist)
-- Parent POM availability (if referenced)
 
 ---
 
 ## Step 2: Get Current Versions
 
-Read the current versions off disk and stage them into `tmp/upgrade-targets.json`. The `to.*` fields are hardcoded in Step 4 for v1 — write them now so the file is complete after this step.
+### 2a. Current Mule Runtime version
 
-From `pom.xml`:
-- `<properties><app.runtime>` (or `<mule.version>`) → `mule.from`
-- `<properties><javaVersion>` (or `<maven.compiler.source>` / `<maven.compiler.target>`) → `java.from`
-- Every `<dependency>` whose `<classifier>` is `mule-plugin` → the in-scope connector list. Pick a short `nick` per artifact (e.g. `mule-amazon-s3-connector` → `s3`).
+Run the detection script (do not parse the POM inline — the script reads the `app.runtime` property from the child, then parent `pom.xml`, resolving `${...}`):
 
-From `mule-artifact.json`:
-- `<minMuleVersion>` — a secondary check on `mule.from`; if it differs from pom, record both.
+```bash
+node scripts/detect_current_mule_version.mjs .
+```
 
-Write `tmp/upgrade-targets.json`:
+It writes the result to `tmp/current-mule-version.json`. Read fields from the file with `jq` (e.g. `jq -r '.version' tmp/current-mule-version.json`) and branch on it:
+
+- **`belowFloor: true`** → the detected `version` is below the minimum supported Mule Runtime (`minSupportedVersion`, currently 4.4). This app is **out of scope** — there is no valid version to prompt for. **Stop** and tell the user to upgrade the app to at least that version before running this skill (see `warnings`).
+- **`version` set, `needsUserPrompt: false`** → use `version` as the current Mule Runtime version. Continue.
+- **`needsUserPrompt: true`** → the script could not settle on a trustworthy version. Inspect `warnings`:
+  - parent declared but not found locally → ask the user to make the parent POM available locally, then re-run this step. **Do not attempt to download it.**
+  - otherwise (nothing resolvable) → ask the user for the current Mule Runtime version. If they cannot provide it, **stop**.
+
+**Floor also applies to a user-supplied version.** Whenever you obtain the current Mule version from the user (any prompt above), apply the same floor yourself: if it is below `minSupportedVersion` (4.4), the app is out of scope — **stop** with the same guidance. The script only floor-checks the version *it* detected; a value the user typed is yours to validate.
+
+Detection source (implemented by the script): the `app.runtime` property — checked in the child `pom.xml`, then the parent `pom.xml` — resolving `${...}` against the merged child+parent properties. This is the only source used for the MRT version. An unresolvable reference falls through to the prompt rather than being accepted literally.
+
+### 2b. Current Java version
+
+Run the detection script (do not read `mule-artifact.json` inline — the script reads `javaSpecificationVersions`):
+
+```bash
+node scripts/detect_current_java_version.mjs .
+```
+
+It writes the result to `tmp/current-java-version.json`. Read fields from the file with `jq` (e.g. `jq -r '.version' tmp/current-java-version.json`) and branch on it:
+
+- **`belowFloor: true`** → the detected `version` is below the minimum supported Java (`minSupportedVersion`, currently 8). This app is **out of scope** — **stop** and tell the user to upgrade the app to at least Java 8 before running this skill (see `warnings`).
+- **`version` set, `needsUserPrompt: false`** → use `version` as the current Java version. Continue.
+- **`needsUserPrompt: true`** → inspect `warnings` / `supportedVersions`:
+  - `supportedVersions` has multiple entries → `mule-artifact.json` declares support for several Java versions; ask the user which one the app currently runs on, then continue.
+  - otherwise (`javaSpecificationVersions` absent/empty, or no `mule-artifact.json`) → ask the user for the current Java version. If they cannot provide it, **stop**.
+
+**Floor also applies to a user-supplied version.** Whenever you obtain the current Java version from the user (any prompt above), apply the same floor yourself: if it is below `minSupportedVersion` (8), the app is out of scope — **stop** with the same guidance. The script only floor-checks the version *it* detected.
+
+Detection source (implemented by the script): `mule-artifact.json` `javaSpecificationVersions` — one entry → use it; multiple → prompt which one; absent/empty (or no `mule-artifact.json`) → prompt the user. This is the only source used for the Java version; `pom.xml` compiler settings are not used as a fallback (they are the compile target, not the deployed runtime Java). Values are normalized (`1.8` → `8`).
+
+---
+
+## Step 3: Build Baseline
+
+Establish that the app builds **on its current versions** before changing anything. A green baseline is the reference point every later step is measured against — if the app doesn't build now, upgrade findings are meaningless.
+
+### 3a. Confirm current versions (detected values only)
+
+Read `tmp/current-mule-version.json` and `tmp/current-java-version.json` from Step 2. For each value that was **auto-detected** (`needsUserPrompt: false`), show the user a single confirmation before building:
+
+> Detected your app's current versions — Mule Runtime **{muleVersion}**, Java **{javaVersion}**. Please confirm to proceed.
+
+- Confirm **only** detected values. A value the user already supplied in Step 2 (via a prompt) is already confirmed — **do not re-ask it.** If both came from the user, skip 3a entirely.
+- If the user corrects a value, use the corrected value from here on and re-apply the floor check (Mule ≥ 4.4, Java ≥ 8) yourself — a corrected value is user-supplied.
+
+The **confirmed current Java major** that comes out of this step — the `version` field from `tmp/current-java-version.json` (when 2b auto-detected), or the value the user supplied/corrected — is `<current-java-major>` below. Use that same value in both 3b and 3c; do not fall back to the raw detected value if it was corrected here.
+
+### 3b. Ensure the current Java JDK is available
+
+The baseline must build on the app's **current** Java, which may differ from whatever `$JAVA_HOME` currently points at. Run the helper with the **confirmed current Java major** from Step 3a (`<current-java-major>`):
+
+```bash
+node scripts/resolve_jdk.mjs <current-java-major> .
+```
+
+It writes `tmp/resolve-jdk-<major>.json`. Read it and branch:
+
+- **`available: true`** → use `javaHome` for the build. It may have come from an already-installed JDK under the Anypoint Code Builder java dir, or a fresh download (`source` / `downloaded` say which).
+- **`errors[]` non-empty (exit 1)** → STOP and surface the errors. Common cause: no JDK of that major installed and no build string resolvable (CLI/DX plugin missing or not authenticated).
+
+This is the same helper Phase 2 uses for the target Java — run it once per Java version needed.
+
+### 3c. Build
+
+Run the baseline build with the resolved `JAVA_HOME` (one `mvn` invocation, nothing else in the response):
+
+```bash
+JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
+```
+
+- **`BUILD SUCCESS`** → baseline established. Continue to Step 4.
+- **Build fails** → STOP. Inform the user the app must build cleanly on its current versions before an upgrade can proceed, and surface the failure. Do not attempt upgrade edits to fix a pre-existing baseline failure.
+
+The resulting `target/*.jar` is used by Step 5's Mode-A describe if introspection needs the packaged extension model.
+
+---
+
+## Step 4: Determine Target Versions
+
+Determine the upgrade target from the confirmed current versions and the **live** runtime list. Never hardcode versions or channels — the script derives everything from `anypoint-cli-v4 dx mule runtime list`.
+
+Run the resolver. It reads the current versions from Step 2's `tmp/` files (or accepts `CURRENT_MULE` / `CURRENT_JAVA` overrides), and — **only if the user has already named a specific target** — validates it when you pass `TARGET_MULE` (and optionally `TARGET_JAVA`):
+
+```bash
+# User has NOT named a target yet — just compute the recommendation:
+node scripts/resolve_target_versions.mjs .
+
+# User explicitly asked for a specific target (e.g. "move me to 4.11"):
+TARGET_MULE=4.11 node scripts/resolve_target_versions.mjs .
+```
+
+**A target is a Mule version.** `TARGET_MULE` is what defines a requested target — only pass it when the user named a specific Mule runtime. Do **not** set `TARGET_MULE` to the current version to express "keep Mule"; that would be read as a downgrade/no-op and refused.
+
+A **bare Java mention** ("upgrade my app to Java 17/11/8/21") is not a separate target — the recommendation always moves Java to the latest non-EOL Java as part of the Mule upgrade. Pass the Java they named via `TARGET_JAVA` alone (no `TARGET_MULE`) so the script can check it against what the recommended runtime supports:
+
+```bash
+# User mentioned only a Java version (e.g. "upgrade to Java 17"):
+TARGET_JAVA=17 node scripts/resolve_target_versions.mjs .
+```
+
+Then always present `options[0]` (the Mule + Java path), and read `requestedJavaOnly`:
+- **`requestedJavaOnly: null`** → the Java they named is the one we recommend (or they named none). Just present the recommendation; no extra message.
+- **`requestedJavaOnly` set** → the named Java is EOL (8/11) or unsupported by the recommended runtime (e.g. 21). Present the recommendation **and** surface `requestedJavaOnly.note` verbatim — it states their Java isn't a supported target and names the Java we do support.
+
+It writes `tmp/target-versions.json`. Read fields with `jq` and branch:
+
+- **`needsUserPrompt: true`** → the script could not settle on a target (no current versions, or the runtime list could not be fetched). Inspect `warnings`: a fetch failure means the CLI is not authenticated (`anypoint-cli-v4 conf`) or offline — surface it and re-run. Do not invent versions.
+- **`nothingToUpgrade: true`** → the app is already on the latest runtime in its channel at the latest patch, on the latest non-EOL Java. Tell the user there is nothing to upgrade and **stop** — do not proceed to Phase 2.
+- **`options[]` non-empty** → this is the **recommended** target (always in-channel: highest minor in the current channel, latest patch, latest non-EOL Java). There is exactly one entry today. Present it as the recommendation.
+
+### 4a. Present the recommendation and get the user's target
+
+The recommendation in `options[0]` is what you propose by default. **Always recommend staying in-channel**, regardless of what the user later chooses. Show it to the user:
+
+> Recommended upgrade: **Mule {options[0].mule}, Java {options[0].java}** ({kind}). {options[0].note, if present}
+
+Then ask whether they want the recommended target or a different one (Java + Mule vs. a specific Mule version). Use `AskUserQuestion` when the choice is not already clear from their original request.
+
+### 4b. If the user names a specific target, validate it
+
+When the user asks for a target other than the recommendation, re-run the script with `TARGET_MULE` (and `TARGET_JAVA` if they named a Java). Read `requestedTarget` from the output and branch on it:
+
+- **`accepted: false`** → the target violates the locked policy. Surface `requestedTarget.reason` verbatim and re-offer the recommendation. Do **not** hand-edit around the refusal. `reasonCode` is one of:
+  - `downgrade` — target is not strictly higher than current (this skill only upgrades).
+  - `eol-java` — target keeps/selects EOL Java (8/11); the skill exists to move apps off EOL Java.
+  - `unsupported-combo` — the target Mule does not support the requested Java.
+  - `unknown-version` — the requested Mule is not in the runtime list.
+- **`accepted: true` and `crossChannel: false`** → in-channel target (including a valid intermediate like 4.4→4.6, or 4.4→latest-LTS). Show **both** the recommendation and their validated target, then let the user pick — unless their request already equals `options[0]` (same Mule + Java), in which case there is no choice to make and you proceed directly:
+
+  > Recommended: **Mule {options[0].mule}, Java {options[0].java}**. Your requested target: **Mule {requestedTarget.mule}, Java {requestedTarget.java}**
+  >
+  > Which do you want to proceed with?
+
+  When `requestedTarget.belowRecommended: true` (their valid target is lower than the latest in-channel runtime), surface `requestedTarget.note` verbatim alongside the choice — it states their target isn't the latest and names the one we recommend. Proceed with whichever the user confirms (`requestedTarget.mule` / `requestedTarget.java` if they keep their choice, else `options[0]`).
+- **`accepted: true` and `crossChannel: true`** → the target switches support channels (LTS↔Edge). This is **allowed, but you MUST warn first.** Surface `requestedTarget.warning` verbatim and get explicit confirmation before proceeding:
+
+  > ⚠️ {requestedTarget.warning}
+  >
+  > Do you want to proceed with the channel switch, or stay on the recommended in-channel target ({options[0].mule})?
+
+  Only continue to Step 5 with the cross-channel target once the user explicitly confirms. If they decline, fall back to the recommended in-channel target.
+
+### 4c. Lock the target
+
+The values you carry into Step 5 and Phase 2 are: **target Mule** and **target Java** — either `options[0]` (recommendation accepted) or `requestedTarget` (a validated, user-confirmed target). Note whether Java changes (`javaChanged`) and whether the parent POM will need touching later. Do not proceed until the user has confirmed a single concrete target.
+
+---
+
+## Step 4.5: Stage the upgrade data-contract (`tmp/upgrade-targets.json`)
+
+Steps 5–21 and the Phase-2 mutation scripts (`apply_runtime_bump.mjs`, the `apply_connector_pin.mjs` loop) do **not** re-read Steps 1–4's individual `tmp/*.json` files. They read a single consolidated contract, `tmp/upgrade-targets.json`. This step writes it from the outputs you already have — it is the seam between the version-resolution half (Steps 1–4) and the connector/introspection half (Steps 5–21). Assemble it with a `Write` (or a `jq` construction), not a new script.
+
+The contract shape:
 
 ```json
 {
-  "mule":       { "from": "4.3.0", "to": "4.10.5" },
-  "java":       { "from": "8",     "to": "17" },
+  "mule":       { "from": "<current>", "to": "<locked target>" },
+  "java":       { "from": "<current>", "to": "<locked target>" },
   "connectors": [
     { "nick": "s3", "groupId": "com.mulesoft.connectors", "artifactId": "mule-amazon-s3-connector", "from": "5.8.4" }
   ]
 }
 ```
 
-- Get current Mule version from pom.xml
-- Get current Java version from mule-artifact.json
+Fill each field from a source you already produced — **never hardcode a version**:
 
----
+- **`mule.from`** ← `jq -r '.version' tmp/current-mule-version.json` (Step 2a), or the value the user supplied/corrected in Step 3a.
+- **`java.from`** ← `jq -r '.version' tmp/current-java-version.json` (Step 2b), or the Step-3a corrected value.
+- **`mule.to` / `java.to`** ← the **locked target from Step 4c**. Read it from `tmp/target-versions.json`: when the recommendation was accepted, that is `.options[0].mule` / `.options[0].java`; when a user-requested target was validated and confirmed, it is `.requestedTarget.mule` / `.requestedTarget.java`. Use exactly the pair the user confirmed in Step 4c — do not re-derive.
+- **`connectors[]`** ← scan `pom.xml` for the in-scope connector list. Every `<dependency>` whose `<classifier>` is `mule-plugin` is a connector to evaluate. For each, record:
+  - `groupId` / `artifactId` — verbatim from the dependency.
+  - `from` — the currently-pinned version (resolve `${...}` against child+parent properties; if inherited from the parent POM with no explicit `<version>`, read it from the parent's `<dependencyManagement>`).
+  - `nick` — a short, stable nickname. **It MUST equal the XSD prefix the flow XML binds for that connector** (`xmlns:<prefix>=...` in `src/main/mule/**/*.xml`), not the artifact slug — e.g. `mule-amazon-s3-connector` → `s3`, `mule-objectstore-connector` → `os`. This nick is the join key across Steps 5 → 6 → 7; picking the artifact slug here breaks the Mode-A ↔ usage join downstream.
 
-## Step 3: Build Baseline
-
-Confirm the app builds on its **current** Mule + Java versions before we touch anything. This runs against the app's OLD Java (whatever `JAVA_HOME` currently points at) — do NOT force Java 17 yet.
-
-```bash
-mvn clean package | tee tmp/baseline-build.log
-```
-
-If the exit is non-zero, HALT and hand back to the user:
-
-> "The app does not build on its current version. Fix the baseline build before starting the upgrade — there is no point in propagating a broken build through connector migrations."
-
-The resulting `target/*.jar` is used by Step 5's Mode-A describe if introspection needs the packaged extension model.
-
-- Run `mvn clean package` on current version
-- Verify app builds successfully
-- Establish baseline JAR for introspection
-
-If build fails, STOP and inform user the app must build on current version before upgrade.
-
----
-
-## Step 4: Determine Target Versions
-
-**v1: hardcoded targets, no user prompt.**
-
-The v1 skill always upgrades to:
-- Mule runtime: `4.10.5`
-- Java: `17`
-
-Both are already written into `tmp/upgrade-targets.json` by Step 2. Do NOT re-prompt the user for "Java-only vs Mule-only vs both" — v1 always upgrades both. Later iterations will restore the choice.
-
-- Ask user: Java upgrade, Mule upgrade, or both?
-- Get or suggest target versions
-- Confirm with user
+After writing, sanity-check the file: `jq -e '.mule.to and .java.to and (.connectors|type=="array")' tmp/upgrade-targets.json`. Every downstream step reads `mule.to`/`java.to` and iterates `.connectors[]` — if either target is null or `connectors` is missing, fix it here before proceeding to Step 5.
 
 ---
 
 ## Step 5: Run Introspection
 
-**Note on v1 ordering:** Step 6 runs first (Exchange-metadata walker for Java-17 picks). This step then does the Mode-A **summary describe** on the version each connector was pinned to in Step 6.
+**Note on ordering:** Step 6 runs first (Exchange-metadata walker for Java-17 picks). This step then does the Mode-A **summary describe** on the version each connector was pinned to in Step 6.
 
-**Java 17+ REQUIRED before invoking `describe_connector.mjs`.** Export a Java 17 `JAVA_HOME` for the shell that runs this step (see Step 13 for the preferred install — Zulu 17 on SFDC laptops). The script hard-refuses to run under Java 8/11 because those JDKs return a degraded describe (empty `configs[].parameters`) that would silently miss required-attribute breaking changes. If Step 1's `mule-dev-env.json` reported `java_version < 17`, refresh it now:
+**Java 17+ REQUIRED before invoking `describe_connector.mjs`.** Export a Java 17 `JAVA_HOME` for the shell that runs this step (see Step 13 for the preferred install — Zulu 17 on SFDC laptops). The script hard-refuses to run under Java 8/11 because those JDKs return a degraded describe (empty `configs[].parameters`) that would silently miss required-attribute breaking changes. If Step 3b resolved only the current (pre-17) JDK, resolve a Java-17 JDK now with the same helper:
 
 ```bash
-export JAVA_HOME="$(/usr/libexec/java_home -v 17)"   # or your Zulu 17 install
-<skill-dir>/../build-mule-integration/scripts/validate_prerequisites.sh
+node <skill-dir>/scripts/resolve_jdk.mjs 17 .
+export JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-17.json)
 ```
 
 For each connector nickname `<nick>` in `tmp/upgrade-targets.json`:
@@ -403,7 +535,7 @@ Every diff residue MUST appear in §7 plan output as an explicit per-symbol edit
 
 ## Step 9: Check DataWeave Compatibility
 
-**No scripts for v1.** The agent reads DW sources directly at plan-synthesis time (Step 12) using the `Read` tool. Compare symbols against Mode-B `.output*` keys from `tmp/connector-metadata/<nick>-new-<op>.json`:
+**No scripts for this step.** The agent reads DW sources directly at plan-synthesis time (Step 12) using the `Read` tool. Compare symbols against Mode-B `.output*` keys from `tmp/connector-metadata/<nick>-new-<op>.json`:
 
 - Symbols present in Mode-B → no change
 - Symbols absent, sibling present → propose a rewrite in the plan
@@ -438,7 +570,7 @@ Findings roll into the plan's "DataWeave downstream impact" section (see `refere
 
 ## Step 10: Check MUnit Compatibility
 
-**No scripts for v1.** The agent reads every `src/test/munit/**/*.xml` directly at plan-synthesis time (Step 12) using the `Read` tool. For each operation the plan will rewrite, flag:
+**No scripts for this step.** The agent reads every `src/test/munit/**/*.xml` directly at plan-synthesis time (Step 12) using the `Read` tool. For each operation the plan will rewrite, flag:
 
 - `<munit-tools:mock-when processor="<old-op>">` → rename plan entry
 - `<munit-tools:then-return>` payload shapes → schema-mismatch flag
@@ -522,7 +654,7 @@ On `No, cancel`: stop the workflow. Leave `tmp/` in place for inspection.
 
 ## Step 13: Download Runtime and Java
 
-**v1 does not automate downloads.** This step is a thin gate that verifies Java 17 is installed locally and that a Mule Runtime ≥ 4.9.x is registered with the Anypoint CLI.
+This step is a thin gate that verifies Java 17 is installed locally and that a Mule Runtime ≥ 4.9.x is registered with the Anypoint CLI.
 
 ```bash
 /usr/libexec/java_home -v 17
@@ -725,7 +857,7 @@ Emit exactly three lines:
 
 1. `BUILD SUCCESS` with the path to `target/<project>-*.jar`.
 2. MUnit verdict from Step 17 (`mvn test: all passing` OR `no runtime validation performed — fixture does not declare munit-maven-plugin`).
-3. One-line from-to summary: `Mule <from> → 4.10.5, Java <from> → 17, connectors: <N> updated`.
+3. One-line from-to summary: `Mule <from> → <to>, Java <from> → <to>, connectors: <N> updated` — read the from/to values from `tmp/upgrade-targets.json` (`.mule.from`/`.mule.to`, `.java.from`/`.java.to`) before Step 20 removed it, or from your locked target in Step 4c.
 
 Do NOT include per-file diffs, "what was done" recaps, or speculative "next steps" — the user can read the diff.
 
@@ -740,15 +872,13 @@ Present final summary:
 
 ## Troubleshooting
 
-**JAVA_HOME not set:** `export JAVA_HOME=$(/usr/libexec/java_home -v 11)`
-
 **anypoint-cli-v4 not found:** `npm install -g @mulesoft/anypoint-cli-v4`
 
 **DX plugin not found:** `npm install -g @salesforce/anypoint-cli-dx-mule-plugin`
 
 **Runtime path required:** first use of `dx mule describe-connector` or related commands prompts for runtime location. The path is saved to `~/.mule-dx/config.json`.
 
-**Parent POM not available:** check workspace or local `.m2` repository. Parent POM must be accessible locally to resolve inherited versions.
+**Parent POM not available:** the parent POM must be accessible locally to resolve inherited versions. Do **not** attempt to download it — ask the user to make it available locally, then re-run Step 2.
 
 **Connector not in Exchange:** cannot upgrade automatically. Flag as blocker and inform user.
 
@@ -763,5 +893,50 @@ Present final summary:
 `<skill-dir>` below is the absolute path you were given in the "skill is now active" message. Use it consistently — do not construct relative `../scripts/...` paths.
 
 ```bash
-# Placeholder for command reference as scripts are added
+# Step 1 — validate prerequisites (writes tmp/upgrade-prereqs.json; non-zero exit => STOP)
+node <skill-dir>/scripts/validate_prerequisites.mjs .
+
+# Step 2a — detect current Mule Runtime version (writes tmp/current-mule-version.json)
+node <skill-dir>/scripts/detect_current_mule_version.mjs .
+
+# Step 2b — detect current Java version (writes tmp/current-java-version.json)
+node <skill-dir>/scripts/detect_current_java_version.mjs .
+
+# Step 3b — ensure the current Java JDK is available (writes tmp/resolve-jdk-<major>.json)
+# MAY download over the network; pass --no-download to only detect an installed JDK.
+node <skill-dir>/scripts/resolve_jdk.mjs <current-java-major> .
+
+# Step 3c — baseline build on the resolved JAVA_HOME (must be BUILD SUCCESS)
+JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
+
+# Step 4 — recommend a target (writes tmp/target-versions.json)
+node <skill-dir>/scripts/resolve_target_versions.mjs .
+
+# Step 4 — validate a user-requested target (only when the user named one)
+TARGET_MULE=4.11 node <skill-dir>/scripts/resolve_target_versions.mjs .
+
+# Step 4.5 — stage the data-contract consumed by Steps 5–21 (write, then sanity-check)
+jq -e '.mule.to and .java.to and (.connectors|type=="array")' tmp/upgrade-targets.json
+
+# Step 5 — Mode-A summary describe of a NEW connector version (Java 17+ required)
+<skill-dir>/scripts/describe_connector.mjs <nick>-new
+
+# Step 6 — resolve latest Java-17-compatible connector version from Exchange
+<skill-dir>/scripts/get_java17_compatible_connector.mjs <groupId> <artifactId> <nick>
+
+# Step 7 — enumerate connector usage from flow XML (parser-preferred, grep fallback rc=3)
+<skill-dir>/scripts/enumerate_usage_xml.mjs <nick> .
+<skill-dir>/scripts/enumerate_usage.mjs <nick> .
+
+# Step 7 — Mode-B (per op/source) and Mode-C (per config-provider) describe
+<skill-dir>/scripts/describe_connector.mjs <nick>-new --type operation --name <op>
+<skill-dir>/scripts/describe_connector.mjs <nick>-new --type connection-provider --name <provider> --config-name <config>
+
+# Step 11.5 — coverage gate (exit 1 => re-run missing describes)
+<skill-dir>/scripts/verify_metadata_coverage.mjs
+
+# Step 14 — deterministic version rewrites
+<skill-dir>/scripts/promote_new_connector_pins.mjs
+<skill-dir>/scripts/apply_runtime_bump.mjs .
+<skill-dir>/scripts/apply_connector_pin.mjs <nick> .
 ```
