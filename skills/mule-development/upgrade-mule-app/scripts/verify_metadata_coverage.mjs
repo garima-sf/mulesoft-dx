@@ -58,12 +58,6 @@ function opName(entry) {
   return '';
 }
 
-/** Mode-A config uses .elementName if present, else .name. @param {any} cfg @returns {string} */
-function configDslName(cfg) {
-  if (!cfg || typeof cfg !== 'object') return '';
-  return String(cfg.elementName || cfg.name || '');
-}
-
 for (const usageFile of usageFiles) {
   const nick = path.basename(usageFile, '.json');
   const usage = readJsonOrNull(usageFile);
@@ -128,36 +122,40 @@ for (const usageFile of usageFiles) {
   }
 
   // --- Mode-C providers ---
-  const configsUsed = Array.isArray(usage.configs_used) ? usage.configs_used : [];
-  const providersUsed = Array.isArray(usage.config_providers_used) ? usage.config_providers_used : [];
+  // Driven from Mode-A .configs[], per references/plan-connector-upgrades.md §5,
+  // in lockstep with the Step 7 fan-out loop (SKILL.md). The pre-fix gate joined
+  // usage.configs_used[] / config_providers_used[] (flow-instance config-ref
+  // values + camelCase child names) against Mode-A SDK names — those never
+  // matched, so declaredProviders was always [], the FAIL branch was
+  // unreachable, and the gate passed green while zero Mode-C files existed
+  // (Phase C then missed reparenting like db's <pooling-profile> and the first
+  // mvn broke). Now: require a Mode-C file for every (config, provider) pair the
+  // fan-out is expected to describe. --config-name is .configs[].name and --name
+  // is the .connectionProviders[] entry — identical tokens to the fan-out, so
+  // the reconstructed filename matches what describe_connector.mjs wrote.
   const modeAConfigs = Array.isArray(modeA.configs) ? modeA.configs : [];
 
-  for (const configName of configsUsed) {
+  for (const cfg of modeAConfigs) {
+    // Fan-out passes `--config-name "$cfg.name"`; mirror that exactly (name
+    // first, elementName only as a defensive fallback).
+    const configName = (cfg && typeof cfg === 'object') ? String(cfg.name || cfg.elementName || '') : '';
     if (!configName) continue;
 
-    const matchedConfig = modeAConfigs.find((c) => configDslName(c) === configName);
-    const declaredProviders = matchedConfig && Array.isArray(matchedConfig.connectionProviders)
-      ? matchedConfig.connectionProviders.map((cp) => (typeof cp === 'string' ? cp : configDslName(cp))).filter(Boolean)
+    const declaredProviders = (cfg && Array.isArray(cfg.connectionProviders))
+      ? cfg.connectionProviders
+        .map((cp) => (typeof cp === 'string' ? cp : String((cp && (cp.name || cp.elementName)) || '')))
+        .filter(Boolean)
       : [];
 
     if (declaredProviders.length === 0) {
-      // Config not in Mode-A OR config has empty connectionProviders — Phase C reads .configs[] directly.
-      const inModeA = modeAConfigs.some((c) => configDslName(c) === configName);
-      if (inModeA) {
-        report.push(`INFO  ${nick}/${configName} — no providers declared in Mode-A (Phase C reads .configs[] directly)`);
-        infoCount += 1;
-      }
-      // If not in Mode-A at all: silently skip (foreign config-ref).
+      // Empty connectionProviders[] — Mode-C is un-runnable here (D7 fallback);
+      // Phase C reads Mode-A .configs[] directly. Non-fatal.
+      report.push(`INFO  ${nick}/${configName} — no providers declared in Mode-A (Phase C reads .configs[] directly)`);
+      infoCount += 1;
       continue;
     }
 
-    for (const prov of providersUsed) {
-      if (!prov) continue;
-      if (!declaredProviders.includes(prov)) {
-        report.push(`WARN  ${nick}/${configName}/${prov} — provider not in Mode-A .configs[].connectionProviders[] (rename or removed)`);
-        warns += 1;
-        continue;
-      }
+    for (const prov of declaredProviders) {
       const modeCPath = path.join(metadataDir, `${nick}-new-${configName}-${prov}.json`);
       if (!isFile(modeCPath)) {
         report.push(`FAIL  ${nick}/${configName}/${prov} — missing Mode-C: ${modeCPath}`);

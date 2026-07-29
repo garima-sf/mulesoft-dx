@@ -61,7 +61,8 @@ This skill ships small Node.js (ESM, zero-dep) scripts under `scripts/`. Invoke 
 | Script | Purpose | Output location |
 | --- | --- | --- |
 | `describe_connector.mjs` | Mode-A/B/C describe of a NEW connector version (summary, per-op, per-config-provider). Invocations (flags — not positional): Mode-A `<nick>-new`; Mode-B `<nick>-new --type operation --name <op>` (or `--type source --name <src>`); Mode-C `<nick>-new --type connection-provider --name <provider> --config-name <config>`. See `references/plan-connector-upgrades.md §2, §4, §5`. | `tmp/connector-metadata/<nick>-new.json`, `<nick>-new-<op>.json`, `<nick>-new-<config>-<provider>.json` |
-| `enumerate_usage.mjs` | Scans `src/main/mule/**/*.xml` for a connector's ops, configs, error types, namespace prefix used by the app. The OLD-side source of truth — replaces re-describing the old connector version. See `references/plan-connector-upgrades.md §3`. | `tmp/connector-usage/<nick>.json` |
+| `enumerate_usage_xml.mjs` | **Preferred** usage enumerator — parses `src/main/mule/**/*.xml` with `fast-xml-parser`. Identical output to `enumerate_usage.mjs` but correct on messy input (ignores commented-out elements; binds `config-ref` to its owning element). Exits rc=3 if `fast-xml-parser` isn't importable → caller falls back to the grep script. See Step 7 "Usage enumeration". | `tmp/connector-usage/<nick>.json` |
+| `enumerate_usage.mjs` | Zero-dependency (regex/grep) usage enumerator — the fallback for `enumerate_usage_xml.mjs`. Scans `src/main/mule/**/*.xml` for a connector's ops, configs, error types, namespace prefix used by the app. The OLD-side source of truth — replaces re-describing the old connector version. See `references/plan-connector-upgrades.md §3`. | `tmp/connector-usage/<nick>.json` |
 | `get_java17_compatible_connector.mjs` | Walks Exchange latest→oldest (max 5 versions) for a `(groupId, artifactId)`; first `is-java-17-supported=true` wins. See `references/plan-connector-upgrades.md §1.5`. | `tmp/connector-choices/<nick>-new.json` |
 | `check_java_compatibility.mjs` | Probes a connector version's `supportedJavaVersions`. Empty metadata → assume Java-17 OK (`feedback_upgrade_java17_defaults`). | stdout `pass` / `warn` / `block` |
 | `apply_connector_pin.mjs` | Bumps one connector's version in `pom.xml` and rewrites its `xsi:schemaLocation` in every flow XML. Deterministic — never hand-edit `xsi:schemaLocation`. | mutates `pom.xml` + `src/main/mule/**/*.xml` |
@@ -270,6 +271,26 @@ See `references/plan-connector-upgrades.md` §2–§5 (Mode-A summary, usage enu
 
 **Prerequisite: Java 17+.** Same rule as Step 5 — `describe_connector.mjs` refuses to run under < Java 17. Verify `$JAVA_HOME` still points at your Java-17 JDK before Mode-B / Mode-C fan-out; a subshell or `cd` may have reset it.
 
+**Usage enumeration — parser-preferred, grep-fallback.** Two interchangeable scripts write the identical `tmp/connector-usage/<nick>.json` shape:
+
+- `enumerate_usage_xml.mjs` — parses each flow with `fast-xml-parser`. Correct on messy input: ignores commented-out elements and binds `config-ref` to the element that actually carries it. **Preferred.**
+- `enumerate_usage.mjs` — zero-dependency regex/grep. Always available; the fallback.
+
+The skill is stateless, so install the parser ephemerally, run it, and remove it. `fast-xml-parser` attaches to the nearest package root — `skills/mule-development/node_modules` (already gitignored; `--no-save` never touches `package.json`). Run enumeration for every in-scope connector like this:
+
+```bash
+SKILL_PKG="<skill-dir>/.."          # skills/mule-development (nearest package root)
+npm install --no-save --prefix "$SKILL_PKG" fast-xml-parser >/dev/null 2>&1 || true
+
+for nick in $(jq -r '.connectors[].nick' tmp/upgrade-targets.json); do
+  # Prefer the parser; rc=3 means fast-xml-parser wasn't importable → grep fallback.
+  <skill-dir>/scripts/enumerate_usage_xml.mjs "$nick" .
+  [ $? -eq 3 ] && <skill-dir>/scripts/enumerate_usage.mjs "$nick" .
+done
+```
+
+The ephemeral `node_modules` is removed in Step 20. If `npm install` is blocked (offline/locked-down), every parser call exits rc=3 and the grep fallback carries the whole step — no manual intervention needed.
+
 **`not_in_use` skip contract.** If `enumerate_usage.mjs` returns a `not_in_use` JSON for a connector (declared in `pom.xml` but zero flow usage), skip Mode-B and Mode-C for that connector. Keep it in the plan under a `pom-only` section so Phase 2 still runs the pin script. Do NOT invent any other pre-Mode-B/C short-circuit — for every connector with real usage, run Mode-B / Mode-C unconditionally; the "no rewrites" verdict falls out of Step 12's plan synthesis when the per-symbol diffs against Mode-B / Mode-C JSONs come back empty.
 
 **Before invoking Mode-B**, intersect `usage.operations_used[]` with `<nick>-new.json .operations[]`:
@@ -322,17 +343,25 @@ for usage in tmp/connector-usage/*.json; do
         <skill-dir>/scripts/describe_connector.mjs "${nick}-new" --type source --name "$src"
     done
 
-    # Mode-C per (config, provider). Skip pairs where Mode-A .configs[<cfg>].connectionProviders[] is empty — D7 fallback.
-    for cfg in $(jq -r '.configs_used[]? // empty' "$usage"); do
-        declared="$(jq -c --arg c "$cfg" '[.configs[]? | select((.elementName // .name) == $c) | .connectionProviders[]? | if type == "string" then . else (.elementName // .name) end]' "$modeA")"
-        [ "$(jq 'length' <<<"$declared")" = "0" ] && continue
-        for prov in $(jq -r '.config_providers_used[]? // empty' "$usage"); do
-            declared_hit="$(jq -r --arg n "$prov" 'index($n) // "none"' <<<"$declared")"
-            [ "$declared_hit" = "none" ] && continue
-            out="tmp/connector-metadata/${nick}-new-${cfg}-${prov}.json"
-            [ -f "$out" ] && continue
-            <skill-dir>/scripts/describe_connector.mjs "${nick}-new" --type connection-provider --name "$prov" --config-name "$cfg"
-        done
+    # Mode-C per (config, provider) — driven from Mode-A .configs[], per §5.
+    # Do NOT drive from usage.configs_used[] / config_providers_used[]: those
+    # hold flow-instance names (config-ref values like db-config-primary, and
+    # camelCase child names like genericConnection) that never equal Mode-A's
+    # SDK names (config, generic) — the old join matched nothing and silently
+    # wrote zero Mode-C files, so Phase C never saw reparenting like db's
+    # <pooling-profile> and the first mvn broke on XSD validation.
+    # --config-name ← .configs[].name; --name ← .configs[].connectionProviders[]
+    # entry. Configs with an empty connectionProviders[] are skipped (D7
+    # fallback — Phase C reads Mode-A .configs[] directly there).
+    jq -r '.configs[]? as $cfg
+             | $cfg.connectionProviders[]?
+             | "\($cfg.name)\t\(if type == "string" then . else (.name // .elementName) end)"' "$modeA" \
+      | while IFS=$'\t' read -r cfg prov; do
+        [ -z "$cfg" ] && continue
+        [ -z "$prov" ] && continue
+        out="tmp/connector-metadata/${nick}-new-${cfg}-${prov}.json"
+        [ -f "$out" ] && continue
+        <skill-dir>/scripts/describe_connector.mjs "${nick}-new" --type connection-provider --name "$prov" --config-name "$cfg"
     done
 done
 ```
@@ -349,6 +378,7 @@ If `verify_metadata_coverage.mjs` prints FAIL rows, re-run the fan-out loop for 
 
 - Mode-B `.attributes[].attributeName` (NOT `.name`) vs `usage.usage_sites[].attributes_set` keys → attribute renames
 - `usage.errorTypes_caught[]` vs Mode-B `.errorTypes[]` ∪ Mode-A `.errorTypes[]` → error-type renames (**mandatory**, not opportunistic — deferring these to build-time self-correction consumes retry budget)
+- **Mode-C `.connectionProviders[].elementName` (the whole set for the connector) vs the OLD flow's `<prefix:config>` connection-element local-name → provider-element rename.** This is the provider element's OWN name changing, not its child-tree — the child-tree bullet below yields zero residue when the provider's children are unchanged, so it will NOT catch this. Test = **set membership after case-normalizing** (Mode-C `elementName` is kebab-case, `usage.config_providers_used[]` is camelCase — fold both to one form before comparing, else a connector that did NOT rename false-positives): if the OLD local-name is **absent from the union of NEW `elementName`s** for that connector, the provider was renamed → plan the `<prefix:config>` child rewrite to the surviving element. A missed provider rename is a guaranteed `process-classes` XSD failure.
 - Mode-C child-tree diff — **recursive**, at BOTH scopes:
   - `.childElements[]` (config-level, walked recursively into every nested `.childElements[]` / `.containedElements[]`) vs OLD flow config-child tree
   - `.connectionProviders[].childElements[]` (provider-level, walked recursively) vs OLD flow provider-child tree
@@ -675,6 +705,10 @@ Remove temporary files created during upgrade:
 
 ```bash
 rm -r tmp/
+# Remove the ephemeral fast-xml-parser install from Step 7 (if it was created).
+# It lands in the nearest package root, skills/mule-development/node_modules,
+# which is gitignored — but the stateless-skill contract is install → use → remove.
+rm -rf "<skill-dir>/../node_modules"
 ```
 
 ---

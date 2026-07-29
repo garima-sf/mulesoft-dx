@@ -115,22 +115,6 @@ export function grepElementNames(files, prefix) {
 }
 
 /**
- * Extract every `config-ref="value"` value across the flow files.
- * @param {string[]} files
- * @returns {string[]} Sorted-unique.
- */
-export function grepConfigRefs(files) {
-  const re = /config-ref="([^"]+)"/g;
-  const seen = new Set();
-  for (const f of files) {
-    const text = readOrEmpty(f);
-    const matches = text.matchAll(re);
-    for (const m of matches) seen.add(m[1]);
-  }
-  return [...seen].sort();
-}
-
-/**
  * Extract error-type strings from `<on-error-{propagate,continue}>` blocks
  * that carry `type="PREFIX_UPPER:CODE"`, filtered by uppercased prefix.
  * @param {string[]} files
