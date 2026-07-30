@@ -47,24 +47,25 @@ if (!isFile(choiceFile)) {
   stderr.write(`❌ missing ${choiceFile} — run Phase C to write connector choices\n`);
   exit(1);
 }
-if (!isFile(metadataFile)) {
-  stderr.write(`❌ missing ${metadataFile} — run describe_connector.mjs for ${nickname}\n`);
-  exit(1);
-}
 
 let gav;
-let metadata;
+// metadata is OPTIONAL: pom-only connectors (no flow usage, so no Mode-A describe)
+// get a choices file but no metadata file. editFlowXsdUrls is null-safe and no-ops
+// the XSD rewrite when metadata is null — the pom <version> bump only needs the GAV.
+let metadata = null;
 try {
   gav = readJson(choiceFile);
 } catch (e) {
   stderr.write(`❌ failed to parse ${choiceFile}: ${e.message}\n`);
   exit(1);
 }
-try {
-  metadata = readJson(metadataFile);
-} catch (e) {
-  stderr.write(`❌ failed to parse ${metadataFile}: ${e.message}\n`);
-  exit(1);
+if (isFile(metadataFile)) {
+  try {
+    metadata = readJson(metadataFile);
+  } catch (e) {
+    stderr.write(`❌ failed to parse ${metadataFile}: ${e.message}\n`);
+    exit(1);
+  }
 }
 
 const pomLog = [];
