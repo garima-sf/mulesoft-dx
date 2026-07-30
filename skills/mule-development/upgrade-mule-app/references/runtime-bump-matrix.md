@@ -1,8 +1,8 @@
 # Runtime bump matrix
 
-Target versions and their compatible tooling for Phase D.5 (`apply_runtime_bump.sh`).
+Target versions and their compatible tooling for the runtime bump (SKILL.md Step 14, `apply_runtime_bump.mjs`).
 
-Kept in sync with `scripts/_apply_runtime_bump.py` (`MULE_MAVEN_PLUGIN_MATRIX`).
+Kept in sync with `lib/pom-edit.mjs` (`MULE_MAVEN_PLUGIN_MATRIX`) — the live source of truth the script imports.
 
 ## Mule runtime → mule-maven-plugin
 
@@ -57,7 +57,7 @@ If your project pins the plugin via `<plugin><groupId>org.mule.tools.maven</grou
 
 ## Verifying the upgrade
 
-After Phase D.5 runs, expect:
+After Step 14's runtime bump runs, expect:
 
 ```bash
 mvn help:evaluate -Dexpression=app.runtime -q -DforceStdout
@@ -71,4 +71,4 @@ jq '.minMuleVersion, .javaSpecificationVersions' mule-artifact.json
 # → ["17"]
 ```
 
-Then run `validate_prerequisites.sh` again to confirm `JAVA_HOME` points at Java 17 before `mvn clean package`.
+`apply_runtime_bump.mjs` itself exits 2 if the running JDK does not match the target Java version, so a stale `JAVA_HOME` is caught here rather than seven steps later at `mvn clean package` (SKILL.md Step 13 is the Java-17 gate).
