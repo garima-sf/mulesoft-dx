@@ -122,7 +122,7 @@ for (const usageFile of usageFiles) {
   }
 
   // --- Mode-C providers ---
-  // Driven from Mode-A .configs[], per references/plan-connector-upgrades.md §5,
+  // Driven from Mode-A .configs[], per SKILL.md Step 7 (Mode-C),
   // in lockstep with the Step 7 fan-out loop (SKILL.md). The pre-fix gate joined
   // usage.configs_used[] / config_providers_used[] (flow-instance config-ref
   // values + camelCase child names) against Mode-A SDK names — those never
