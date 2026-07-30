@@ -60,6 +60,14 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// A pre-release / non-GA version carries a qualifier after a hyphen
+// (e.g. 1.7.0-rc1, 2.0.0-SNAPSHOT, 1.5.0-beta). We never upgrade TO one, so these
+// are excluded from candidate selection even though Exchange publishes them with
+// the same compat tags as GA.
+function isPreRelease(version) {
+  return String(version).includes("-");
+}
+
 // Compare two dotted version strings numerically, segment by segment. A missing
 // segment counts as 0, so "4.1" == "4.1.0". Returns -1 / 0 / 1.
 function cmpVersion(a, b) {
@@ -259,8 +267,12 @@ function main() {
       continue;
     }
 
-    // Keep versions that support the target Java AND whose Mule floor fits the target.
+    // Keep GA versions that support the target Java AND whose Mule floor fits the
+    // target. Pre-releases (rc/beta/SNAPSHOT/…) are excluded up front: an upgrade
+    // must never target a non-GA build, and Exchange tags them the same as GA so
+    // the Java/Mule filter alone can't distinguish them.
     const candidates = versionsFrom(asset).filter((v) => {
+      if (isPreRelease(v.version)) return false;
       const javaOk = v.java.includes(targetJavaNum);
       const muleOk = v.minMule ? cmpVersion(v.minMule, targetMule) <= 0 : false;
       return javaOk && muleOk;
