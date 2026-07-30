@@ -7,8 +7,9 @@
 // Part of upgrade-mule-app skill.
 //
 // Step 2a helper — detect the current Mule Runtime version from the `app.runtime`
-// property (child pom.xml, then parent). ${...} refs resolve against the merged
-// child+parent properties. Never prompts; signals the caller via needsUserPrompt.
+// property, searching the child pom.xml then its full local parent chain (parent,
+// grandparent, ...). ${...} refs resolve against the merged properties of the whole
+// chain (nearer wins). Never prompts; signals the caller via needsUserPrompt.
 //
 // Usage:
 //   node detect_current_mule_version.mjs [projectDir]
@@ -32,6 +33,7 @@ import {
   extractProperties,
   resolveValue,
   findParentPomPath,
+  readPomProject,
 } from "./_pom_utils.mjs";
 
 // Don't crash if a downstream consumer (e.g. `head`) closes stdout early.
@@ -87,7 +89,7 @@ function main() {
     projectDir,
     version: null,          // resolved MRT version, or null
     source: null,           // e.g. "app.runtime"
-    resolvedFrom: null,     // "child" | "parent" | null
+    resolvedFrom: null,     // "child" | "parent" | "ancestor" | null
     needsUserPrompt: false,
     belowFloor: false,      // version < MIN_SUPPORTED_MULE_VERSION
     minSupportedVersion: MIN_SUPPORTED_MULE_VERSION,
@@ -105,32 +107,51 @@ function main() {
   const childProject = projectOf(parseXml(readFileSync(childPomPath, "utf8")));
   const childProps = extractProperties(childProject);
 
-  // Parent pom.xml, if declared and locally available.
-  const parentPomPath = findParentPomPath(childProject, childPomPath);
-  let parentProject = null;
-  let parentProps = {};
-  if (parentPomPath) {
+  // Walk the local parent chain (parent, grandparent, ...) as far as the POMs are
+  // readable on disk. app.runtime — and any ${...} it references — may be declared
+  // on ANY ancestor, not just the direct parent, so search the whole chain.
+  // ancestors[0] is the direct parent, [1] the grandparent, etc.
+  const ancestors = []; // { props, path }
+  let curProject = childProject;
+  let curPath = childPomPath;
+  const seenPoms = new Set([childPomPath]);
+  while (true) {
+    const nextPath = findParentPomPath(curProject, curPath);
+    if (!nextPath || seenPoms.has(nextPath)) break; // no parent, or a chain cycle
+    seenPoms.add(nextPath);
+    let nextProject;
     try {
-      parentProject = projectOf(parseXml(readFileSync(parentPomPath, "utf8")));
-      parentProps = extractProperties(parentProject);
-      result.notes.push(`Parent POM: ${parentPomPath}`);
+      nextProject = readPomProject(nextPath);
     } catch (e) {
-      result.warnings.push(`Failed to read parent POM ${parentPomPath}: ${e.message}`);
+      result.warnings.push(`Failed to read parent POM ${nextPath}: ${e.message}`);
+      break;
     }
+    ancestors.push({ props: extractProperties(nextProject), path: nextPath });
+    result.notes.push(`Parent POM: ${nextPath}`);
+    curProject = nextProject;
+    curPath = nextPath;
   }
-  // Message severity depends on whether detection needed the parent; defer it.
-  const parentDeclaredButMissing = !parentProject && !!child(childProject, "parent");
+  // The direct parent was declared but could not be read locally.
+  const parentDeclaredButMissing = ancestors.length === 0 && !!child(childProject, "parent");
 
-  // Merged table for ${...} resolution: child wins over parent.
-  const mergedProps = { ...parentProps, ...childProps };
+  // Merged table for ${...} resolution: nearer wins over farther, child over all.
+  // Spread farthest-first so the child assignment lands last.
+  const mergedProps = {};
+  for (let i = ancestors.length - 1; i >= 0; i--) Object.assign(mergedProps, ancestors[i].props);
+  Object.assign(mergedProps, childProps);
 
-  // Try child, then parent.
+  // Look for app.runtime nearest-first: child, then each ancestor.
   let found = detectInProps(childProps, mergedProps);
   if (found) {
     result.resolvedFrom = "child";
-  } else if (parentProject) {
-    found = detectInProps(parentProps, mergedProps);
-    if (found) result.resolvedFrom = "parent";
+  } else {
+    for (let i = 0; i < ancestors.length; i++) {
+      found = detectInProps(ancestors[i].props, mergedProps);
+      if (found) {
+        result.resolvedFrom = i === 0 ? "parent" : "ancestor";
+        break;
+      }
+    }
   }
 
   if (found) {
@@ -156,9 +177,12 @@ function main() {
         "the parent POM available locally and re-run."
       );
     } else {
+      const chain = ancestors.length
+        ? "the child pom.xml or its parent chain (" + ancestors.map((a) => a.path).join(", ") + ")"
+        : "the child pom.xml";
       result.warnings.push(
-        "Could not determine Mule Runtime version from app.runtime in the child " +
-        "or parent pom.xml. Prompt the user for the current version."
+        `Could not determine Mule Runtime version from app.runtime in ${chain}. ` +
+        `Prompt the user for the current version.`
       );
     }
   }

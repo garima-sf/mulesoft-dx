@@ -107,20 +107,25 @@ export function extractProperties(project) {
   return props;
 }
 
-// Resolve a possibly-${prop} raw value against a merged property table.
-// Returns a concrete string, or null if it cannot be resolved (unknown prop or
-// a reference cycle). Supports nested references like ${a} -> ${b} -> 4.6.0.
+// Resolve a raw value that may contain ${prop} references against a merged
+// property table. Substitutes EVERY ${...} occurrence, so composite values like
+// ${major}.${minor}, 1.7.${patch} and v${x} resolve, not just a whole-string
+// ${x}. Each reference is expanded recursively (nested ${a} -> ${b} -> 4.6.0)
+// with a per-branch cycle guard. Returns the fully-substituted string, or null
+// if ANY reference is unknown or cyclic (a partially-resolved version is useless
+// as an Exchange coordinate, so it is reported as unresolved rather than emitted).
 export function resolveValue(raw, mergedProps, seen = new Set()) {
   if (raw == null) return null;
   const v = String(raw).trim();
   if (!v) return null;
-  const m = v.match(PROP_REF);
-  if (!m) return v; // literal
-  const key = m[1];
-  if (seen.has(key)) return null; // cycle
-  seen.add(key);
-  if (!(key in mergedProps)) return null; // unresolved reference
-  return resolveValue(mergedProps[key], mergedProps, seen);
+  let unresolved = false;
+  const out = v.replace(/\$\{([^}]+)\}/g, (_, key) => {
+    if (seen.has(key) || !(key in mergedProps)) { unresolved = true; return ""; }
+    const sub = resolveValue(mergedProps[key], mergedProps, new Set([...seen, key]));
+    if (sub == null) { unresolved = true; return ""; }
+    return sub;
+  });
+  return unresolved ? null : out;
 }
 
 // Locate the parent pom.xml on disk via <parent><relativePath> or ../pom.xml.
@@ -181,4 +186,47 @@ function matchesParentIdentity(pomPath, wantGroupId, wantArtifactId) {
 // Convenience: parse a POM file from disk into its <project> node.
 export function readPomProject(pomPath) {
   return projectOf(parseXml(readFileSync(pomPath, "utf8")));
+}
+
+// Look for groupId:artifactId in one project's <dependencyManagement> and, if
+// found, return its <version> resolved against props (or null if unresolved/absent).
+function managedVersionIn(project, groupId, artifactId, props) {
+  const dm = child(project, "dependencyManagement");
+  const dmDeps = dm ? child(dm, "dependencies") : null;
+  if (!dmDeps) return null;
+  for (const dep of children(dmDeps, "dependency")) {
+    if (textOf(child(dep, "groupId")) !== groupId) continue;
+    if (textOf(child(dep, "artifactId")) !== artifactId) continue;
+    const rawV = textOf(child(dep, "version"));
+    const resolved = rawV ? resolveValue(rawV, props) : null;
+    if (resolved) return resolved; // resolveValue returns null unless fully resolved
+  }
+  return null;
+}
+
+// Resolve a version-less <dependency>'s version from a local <dependencyManagement>
+// — the project's own, or a parent/grandparent's up the chain. This is what Maven
+// does building the effective model, restricted to POMs on the local filesystem
+// (no ~/.m2 or remote fetch). At each level a managed ${...} is resolved against
+// that level's properties, with descendant props (passed down via `props`) winning.
+// Returns { version, definedIn } (the POM to edit) or null if no local POM manages it.
+export function findManagedVersion(project, pomPath, groupId, artifactId, props = {}, seen = new Set()) {
+  if (seen.has(pomPath)) return null; // parent-chain cycle guard
+  seen.add(pomPath);
+
+  // This POM's own dependencyManagement first (a child can manage its own deps).
+  const here = managedVersionIn(project, groupId, artifactId, props);
+  if (here) return { version: here, definedIn: pomPath };
+
+  const parentPomPath = findParentPomPath(project, pomPath);
+  if (!parentPomPath) return null;
+  let parentProject;
+  try {
+    parentProject = readPomProject(parentPomPath);
+  } catch {
+    return null;
+  }
+  // Descendant props win over this ancestor's own; carry the merge down the chain.
+  const mergedProps = { ...extractProperties(parentProject), ...props };
+  return findManagedVersion(parentProject, parentPomPath, groupId, artifactId, mergedProps, seen);
 }
