@@ -57,7 +57,7 @@ anypoint-cli-v4 conf password <password>
 
 ## Bundled scripts
 
-This skill ships small scripts under `scripts/`. Invoke them with the `Bash` tool — do not inline their contents into a response. The scripts persist their output to disk so later steps can consume it mechanically and are not at the mercy of shell variables that vanish when a Bash tool call returns:
+This skill ships small Node.js (ESM, zero-dep) scripts under `scripts/`. Invoke them with the `Bash` tool — do not inline their contents into a response. The scripts persist their output to disk so later steps can consume it mechanically and are not at the mercy of shell variables that vanish when a Bash tool call returns:
 
 | Script | Purpose | Output location |
 | --- | --- | --- |
@@ -69,7 +69,16 @@ This skill ships small scripts under `scripts/`. Invoke them with the `Bash` too
 | `scripts/extract_connectors.mjs` | Step 5a — extract the connector dependencies (`<classifier>mule-plugin</classifier>`, non-test-scoped) from the app's `pom.xml` and its full local ancestor chain (parent, grandparent, …), resolving each version from the local POMs: inline, `${...}` (single, nested, or composite like `${major}.${minor}`), inherited `<dependencies>`, and version-less deps managed in any local `<dependencyManagement>` (this POM's own or an ancestor's). Deterministic static parse; no CLI, no network. Advisory — always exits 0 | `tmp/connectors.json` (contains `connectors[]` {`nick`, `groupId`, `artifactId`, `version`, `versionResolved`, `resolvedFrom`, `versionManagedIn?`}, `excluded[]` (test-scoped), `needsUserPrompt`, `warnings[]`, ...) |
 | `scripts/check_connector_java_compat.mjs` | Step 5b — for each connector from Step 5a, `exchange asset describe <groupId>/<assetId>/<version>` (exact lookup, with retries) and read its `is-java-*-supported` tags to report which Java versions the CURRENT in-use version supports. HARD-STOPS (exit 1, `stop: true`) when a connector cannot be verified: describe fails (not resolvable in Exchange), or no `is-java-*` tags are present | `tmp/connector-java-compat.json` (contains `connectors[]` {`nick`, `groupId`, `artifactId`, `version`, `supportedJava[]`, `blocked`, `blockReason`}, `blocked[]`, `stop`, `warnings[]`, ...) |
 | `scripts/resolve_target_connectors.mjs` | Step 6 — for each connector from Step 5, find the LATEST published version that supports BOTH the target Mule and target Java (from Step 4). One `exchange asset describe` per connector returns every sibling version with its own `min-mule-version` / `is-java-*-supported` tags; filters locally to versions where `is-java-<targetJava>-supported == true` AND `min-mule-version <= targetMule`, then picks the highest by semver. HARD-STOPS (exit 1, `stop: true`) when a connector has no target-compatible version. Target comes from `TARGET_MULE`/`TARGET_JAVA` env or `tmp/target-versions.json` `options[0]` | `tmp/target-connectors.json` (contains `targetMule`, `targetJava`, `connectors[]` {`nick`, `groupId`, `artifactId`, `currentVersion`, `targetVersion`, `changed`, `candidateCount`, `minMuleVersion`, `supportedJava[]`, `blocked`, `blockReason`}, `blocked[]`, `stop`, `warnings[]`, ...) |
-| `scripts/_pom_utils.mjs` | Shared library — tolerant XML parser, `${...}` property resolution (single/nested/composite, cycle-guarded), local parent-POM location (with parent-identity verification), and managed-version lookup across the local ancestor chain. Used by the detection/validation/extraction scripts above. Not invoked directly | (imported) |
+| `scripts/_pom_utils.mjs` | Shared library (Steps 1–6) — tolerant XML parser, `${...}` property resolution (single/nested/composite, cycle-guarded), local parent-POM location (with parent-identity verification), and managed-version lookup across the local ancestor chain. Used by the detection/validation/extraction scripts above. Not invoked directly | (imported) |
+| `describe_connector.mjs` | Mode-A/B/C describe of a NEW connector version (summary, per-op, per-config-provider). Invocations (flags — not positional): Mode-A `<nick>-new`; Mode-B `<nick>-new --type operation --name <op>` (or `--type source --name <src>`); Mode-C `<nick>-new --type connection-provider --name <provider> --config-name <config>`. See Step 7 (7a Mode-A, 7b Mode-B/C). | `tmp/connector-metadata/<nick>-new.json`, `<nick>-new-<op>.json`, `<nick>-new-<config>-<provider>.json` |
+| `enumerate_usage_xml.mjs` | **Preferred** usage enumerator — parses `src/main/mule/**/*.xml` with `fast-xml-parser`. Identical output to `enumerate_usage.mjs` but correct on messy input (ignores commented-out elements; binds `config-ref` to its owning element). Exits rc=3 if `fast-xml-parser` isn't importable → caller falls back to the grep script. See Step 7 "Usage enumeration". | `tmp/connector-usage/<nick>.json` |
+| `enumerate_usage.mjs` | Zero-dependency (regex/grep) usage enumerator — the fallback for `enumerate_usage_xml.mjs`. Scans `src/main/mule/**/*.xml` for a connector's ops, configs, error types, namespace prefix used by the app. The OLD-side source of truth — replaces re-describing the old connector version. See Step 7b (usage enumeration + output shape). | `tmp/connector-usage/<nick>.json` |
+| `apply_connector_pin.mjs` | Bumps one connector's version in `pom.xml` and rewrites its `xsi:schemaLocation` in every flow XML. Reads `tmp/connector-choices/<nick>-new.json` (GAV, required) and `tmp/connector-metadata/<nick>-new.json` (namespace metadata, **optional** — absent for pom-only connectors, in which case the XSD rewrite no-ops). Deterministic — never hand-edit `xsi:schemaLocation`. | mutates `pom.xml` + `src/main/mule/**/*.xml` |
+| `apply_runtime_bump.mjs` | Bumps `<app.runtime>`, `<javaVersion>`, `<maven.compiler.source/target>`, `<mule.maven.plugin.version>` in `pom.xml`, and `minMuleVersion` + `javaSpecificationVersions` in `mule-artifact.json`. Reads targets from `tmp/upgrade-targets.json` (`.mule.to` / `.java.to`). Matrix in `references/runtime-bump-matrix.md`. Exits 2 if running Java doesn't match the target. | mutates `pom.xml` + `mule-artifact.json` (+ `.mvn/jvm.config` on Java 17) |
+| `promote_new_connector_pins.mjs` | Copies every `tmp/connector-choices/<nick>-new.json` → `tmp/connector-versions/<nick>.json` so Phase 2's pin script can consume them. Run once, before `apply_connector_pin.mjs`. | `tmp/connector-versions/<nick>.json` |
+| `verify_metadata_coverage.mjs` | Step 11.5 gate — for every op / source / provider in `tmp/connector-usage/*.json`, verify a Mode-B / Mode-C JSON exists in `tmp/connector-metadata/`. Exits 1 with FAIL rows when any required per-op / per-provider describe is missing. Configs whose Mode-A `.connectionProviders[]` is empty (D7 fallback — some DB configs) emit INFO and do not fail; Phase C reads Mode-A `.configs[]` directly for those. Optional `--strict` also fails on WARN rows (renamed / removed ops that lack a `<nick>-op-renames.json` entry). | stdout FAIL/WARN/INFO rows |
+
+Shared helpers live in `lib/*.mjs` alongside `scripts/`: `anypoint.mjs` (CLI env scrubbing), `fsx.mjs` (I/O), `platform.mjs` (Java version parsing), `pom-edit.mjs` (pom.xml + mule-artifact.json + XSD rewrites), `xml-flow.mjs` (flow XML grep primitives). Steps 1–6's detection/validation/extraction scripts share `scripts/_pom_utils.mjs` (tolerant XML + `${...}` + parent-POM location + managed-version lookup); Steps 7–21's edit scripts use `lib/pom-edit.mjs` — the two POM helpers are independent and both survive. The pre-2.0.0 bash + Python originals live under `scripts/archive/` for parity reference and rollback; the skill runtime does not invoke them.
 
 Invoke scripts by the absolute path you were given in the "skill is now active" message (it is the directory containing this `SKILL.md`). Do **not** construct relative paths like `../scripts/...` — Cline's working directory shifts across turns and relative paths have produced "No such file or directory" errors in real runs. The inline step examples below write `scripts/...` as shorthand; substitute `<skill-dir>/scripts/...` when you actually execute them.
 
@@ -96,6 +105,8 @@ Phase 2 MUST NOT start until Step 12's approval gate has been passed explicitly.
 - **Use the bundled scripts — do not reimplement them.** When a step ships a script (see "Bundled scripts"), run *that script* and read its JSON output. Do **not** hand-roll its logic with raw `anypoint-cli-v4 exchange asset list`/`describe` + `jq`, and do not "verify" or "double-check" its result by querying Exchange yourself. The scripts are the source of truth; they use exact `asset describe` lookups, whereas ad-hoc `asset list` is fuzzy and paginated (it silently misses versions and returns sibling assets), which produces wrong answers. If a script seems wrong, say so and stop — don't route around it. In particular, Step 6 connector target versions come **only** from `resolve_target_connectors.mjs`.
 - **Version resolution from scripts/CLI only.** All versions come from the bundled scripts (or, where a step has no script, the CLI command that step names), never hardcoded. Never paste versions from memory or documentation.
 - **One step at a time.** Do the current step's work and stop. Do not jump ahead to gather data for later steps (e.g. plugin versions, flow/DataWeave review) while still on Step 6 — each step has its own script and instructions.
+- **Java 17+ REQUIRED for every `describe_connector.mjs` call.** Under Java 8 or 11 the Anypoint CLI's `dx mule describe-connector` still exits 0 but returns a DEGRADED response — `configs[]` collapse to `{name, connectionProviders: []}` with no `parameters` / `attributes`, silently hiding required-attribute breaking changes. The skill's Phase-C diff then signs off on a config that is actually broken, and `mvn` fails at `process-classes` with an XSD-validation error (`cvc-complex-type.4: Attribute 'X' must appear on element '<prefix>:<config>'`). Before invoking `describe_connector.mjs` (Mode-A/B/C) in Step 7 — or the lazy single-connector re-describe in Step 16 class 6 — export a Java 17+ `JAVA_HOME` (Zulu 17 preferred on SFDC laptops for Nexus TLS — see Step 13). The script itself refuses to run under < Java 17 and exits with a fix-it message, so a stale `JAVA_HOME` is caught immediately, not seven steps later at packaging.
+- **`not_in_use` skip — the ONLY pre-Mode-B/C skip.** If Step 7's `enumerate_usage.mjs` prints a `not_in_use` JSON on stdout, the connector is declared in `pom.xml` but has zero flow usage. Reduce the plan for that connector to "bump the pom version only — no flow edits, no per-op describe." Skip Mode-B and Mode-C, but keep the connector in the plan under a `pom-only` section so Phase 2 still runs `apply_connector_pin.mjs`. Do NOT invent any other "stable connector" short-circuit — for every connector with real usage, run Mode-B / Mode-C unconditionally and let Step 12's plan synthesis surface "no rewrites" naturally by finding zero per-symbol diffs against the Mode-B / Mode-C JSONs.
 
 ---
 
@@ -116,6 +127,8 @@ It writes the validation findings to `tmp/upgrade-prereqs.json` (read fields wit
 - **Toolchain missing** (`cliPresent` / `dxPluginPresent` false) → point the user at the install commands in Prerequisites.
 
 Only proceed to Step 2 once the script exits zero.
+
+Do **not** gate on JAVA_HOME pointing at Java 17 here. Step 3 builds the app on its **current** Java (usually 8 or 11); Step 13 is the Java-17 gate.
 
 ---
 
@@ -203,6 +216,8 @@ JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
 
 - **`BUILD SUCCESS`** → baseline established. Continue to Step 4.
 - **Build fails** → STOP. Inform the user the app must build cleanly on its current versions before an upgrade can proceed, and surface the failure. Do not attempt upgrade edits to fix a pre-existing baseline failure.
+
+The resulting `target/*.jar` is used by Step 7's Mode-A describe if introspection needs the packaged extension model.
 
 ---
 
@@ -362,9 +377,241 @@ It writes `tmp/target-connectors.json` and **exits 1 when `stop: true`**. Read i
 
 ---
 
+## Step 6.5: Stage the downstream data-contracts (bridge)
+
+Steps 7–21 and the Phase-2 mutation scripts do **not** re-read Steps 1–6's individual `tmp/*.json` files. They read two consolidated contracts that this step writes from the outputs you already have. It is the seam between the version-resolution half (Steps 1–6) and the introspection/execute half (Steps 7–21). Assemble both with a `Write` (or a `jq` construction), **not a new script** — no CLI, no network here.
+
+**Why a remap is needed.** Steps 5–6 key each connector by a nickname derived from its **artifact slug** (`mule-amazon-s3-connector` → `amazon-s3`, `mule-objectstore-connector` → `objectstore`). Steps 7/14 key on the **XSD prefix** the flow XML actually binds (`xmlns:s3=…` → `s3`, `xmlns:os=…` → `os`, `xmlns:sfdc=…` → `sfdc`). The Step-7 join between usage (`connector-usage/<prefix>.json`) and metadata/choices (`…/<nick>-new.json`) is an exact string match — so the choices/targets files this step writes **must** be keyed by the XSD prefix, not the slug. Read the bindings from `src/main/mule/**/*.xml` (`grep -ho 'xmlns:[a-zA-Z0-9_-]*=' src/main/mule/*.xml`), and for each connector in `tmp/target-connectors.json` map its `groupId:artifactId` to the prefix whose namespace URI matches that connector (agent judgment — the same mapping the old Step 4.5 used to assign nicks).
+
+**Used vs pom-only — classification falls out of that same xmlns read:**
+- **Used** (the connector has an `xmlns:<prefix>` binding somewhere under `src/main/mule/`) → key it by that **prefix**. It gets the full Step 7 (Mode-A + usage + Mode-B/C).
+- **pom-only** (no binding anywhere) → key it by its **slug** nick. It gets a choices file only — **no metadata, no describe.** Its version still gets bumped in Phase 2; its (absent) flow XSD URLs no-op harmlessly.
+
+### 6.5a. Per-connector choices — `tmp/connector-choices/<nick>-new.json`
+
+For every connector in `tmp/target-connectors.json`, write one file keyed by its resolved `<nick>` (prefix for used, slug for pom-only):
+
+```json
+{ "groupId": "com.mulesoft.connectors", "assetId": "mule-amazon-s3-connector", "version": "<targetVersion>" }
+```
+
+- `groupId` / `assetId` ← the connector's `groupId` / `artifactId` from `tmp/target-connectors.json` (verbatim).
+- `version` ← its `targetVersion` (the **target** pin — we describe NEW only, and Phase 2 pins to this).
+
+`describe_connector.mjs <nick>-new` and `apply_connector_pin.mjs <nick>` both read this file. Write **no** metadata stub for pom-only connectors — `apply_connector_pin.mjs` treats `tmp/connector-metadata/<nick>-new.json` as optional and no-ops the XSD rewrite when it is absent.
+
+### 6.5b. The upgrade-targets contract — `tmp/upgrade-targets.json`
+
+`apply_runtime_bump.mjs` reads `.mule.to` / `.java.to`; the `.connectors[].nick` loops in Steps 7/14/21 iterate `.connectors[]`. Shape:
+
+```json
+{
+  "mule":       { "from": "<current>", "to": "<locked target>" },
+  "java":       { "from": "<current>", "to": "<locked target>" },
+  "connectors": [
+    { "nick": "s3", "groupId": "com.mulesoft.connectors", "artifactId": "mule-amazon-s3-connector", "from": "5.8.4" }
+  ]
+}
+```
+
+Fill each field from a source you already produced — **never hardcode a version**:
+
+- **`mule.from`** ← `jq -r '.version' tmp/current-mule-version.json` (Step 2a), or the value the user supplied/corrected in Step 3a.
+- **`java.from`** ← `jq -r '.version' tmp/current-java-version.json` (Step 2b), or the Step-3a corrected value.
+- **`mule.to` / `java.to`** ← the **locked target from Step 4c**. Read it from `tmp/target-versions.json`: recommendation accepted → `.options[0].mule` / `.options[0].java`; user-requested target validated and confirmed → `.requestedTarget.mule` / `.requestedTarget.java`. Use exactly the pair the user confirmed — do not re-derive.
+- **`connectors[]`** ← one entry per connector in `tmp/target-connectors.json`: `nick` remapped to the XSD prefix (used) or slug (pom-only), `groupId`/`artifactId` verbatim, `from` ← its `currentVersion`.
+
+After writing, sanity-check: `jq -e '.mule.to and .java.to and (.connectors|type=="array")' tmp/upgrade-targets.json`. Every downstream step reads `mule.to`/`java.to` and iterates `.connectors[]` — if either target is null or `connectors` is missing, fix it here before proceeding to Step 7.
+
+---
+
 ## Step 7: Check Operations/Configs/Error Types Changes
 
-(To be implemented)
+Discover, from the NEW connector versions, what changed in operations, configs, and error types — so Step 12 can synthesize a mechanical, per-symbol upgrade plan. Four describe modes feed this: 7a Mode-A summary, 7b usage enumeration (the OLD-side source of truth — a flow-XML scan, **not** a second describe), 7b Mode-B per-op, and 7b Mode-C per-config-provider. Each mode's output shape is documented inline below.
+
+**Prerequisite: Java 17+ (before any `describe_connector.mjs` call).** Export a Java 17 `JAVA_HOME` for the shell that runs this step (see Step 13 for the preferred install — Zulu 17 on SFDC laptops). The script hard-refuses to run under Java 8/11 because those JDKs return a degraded describe (empty `configs[].parameters`) that would silently miss required-attribute breaking changes. If Step 3b resolved only the current (pre-17) JDK, resolve a Java-17 JDK now with the same helper, and re-verify `$JAVA_HOME` before the Mode-B / Mode-C fan-out (a subshell or `cd` may have reset it):
+
+```bash
+node <skill-dir>/scripts/resolve_jdk.mjs 17 .
+export JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-17.json)
+```
+
+### 7a. Mode-A summary describe (the NEW version each connector was pinned to in Step 6)
+
+For each **used** connector nickname `<nick>` in `tmp/upgrade-targets.json` (skip pom-only — they have no flow usage to introspect):
+
+```bash
+<skill-dir>/scripts/describe_connector.mjs <nick>-new
+```
+
+**Nickname discipline (BLOCKER).** `<nick>` MUST equal the XSD prefix the flow XML uses (`crypto`, `os`, `xml-module`, `saml`), NOT the artifact slug (`cryptography`, `objectstore`, `xml`). Step 6.5 already remapped the choices/targets files to the prefix; keep it consistent across Mode-A → Mode-B → Mode-C. `enumerate_usage.mjs` will still resolve a mismatched nick by scanning every `*-new.json` for `.namespace.prefix == <nick>`, but relying on that fallback means every downstream script has to be called with the right stem too — cheaper to keep the prefix.
+
+Verify `tmp/connector-metadata/<nick>-new.json` exists before proceeding, and that its `.namespace` is an object with a non-empty `.prefix`. `describe_connector.mjs` refuses to persist a Mode-A file whose `.namespace` is a bare string — if the CLI describe is blocked (entitlement-gated connector) and you're hand-drafting metadata, follow the object shape `{"prefix": "...", "namespace": "...", "schemaLocation": "..."}` or the usage extractor below will exit with a jq indexing error.
+
+`describe_connector.mjs` forwards `-Dmule.jvm.version.extension.enforcement=LOOSE` so the new connector still describes under Java 17 even when its extension model declares `supportedJavaVersions=[1.8, 11]`.
+
+Writes `tmp/connector-metadata/<nick>-new.json` — the top-level summary. **Mode-A JSON shape:**
+
+- `operations[]` — top-level operation names (strings)
+- `sources[]` — top-level source names
+- `configs[]` — each `{name, connectionProviders: [...bare strings...]}`. Providers are **bare strings** in the summary; the DSL `.elementName` is populated only in the Mode-C output (see 7b).
+- `errorTypes[]` — connector-wide error-type union
+- `supportedJavaVersions[]` — declared Java compatibility window
+
+The summary does NOT carry per-op attribute lists or per-config-provider DSL element names — those come from Mode-B (per-op) and Mode-C (per-config-provider) in 7b.
+
+**Mode-A ≠ Mode-B — do NOT grep Mode-A for attribute names.** The summary lists `.operations[].name` and `.configs[].name` only; it does NOT carry `.operations[<op>].attributes[]` or `.childElements[]`. Attribute renames, required-attribute additions, and attribute→child promotions are only visible in Mode-B (`<nick>-new-<op>.json`). Building the plan's per-op attribute diff off Mode-A will silently miss XSD-breaking changes — the build then fails at `process-classes` with `cvc-complex-type.3.2.2` errors that could have been caught at plan time. If you need an attribute, run Mode-B for that op.
+
+**Describe is NEW-only.** Do NOT describe the OLD connector version — the OLD-side source of truth is `enumerate_usage.mjs` (flow XML scan) below, not a second describe. Pre-4.6-era connectors often fail to describe under a Java-17 JDK; the skill is designed to work without OLD describe. See `feedback_upgrade_describe_new_only`.
+
+### 7b. Usage enumeration and per-symbol fan-out
+
+**Usage enumeration — parser-preferred, grep-fallback.** Two interchangeable scripts write the identical `tmp/connector-usage/<nick>.json` shape:
+
+- `enumerate_usage_xml.mjs` — parses each flow with `fast-xml-parser`. Correct on messy input: ignores commented-out elements and binds `config-ref` to the element that actually carries it. **Preferred.**
+- `enumerate_usage.mjs` — zero-dependency regex/grep. Always available; the fallback.
+
+The skill is stateless, so install the parser ephemerally, run it, and remove it. `fast-xml-parser` attaches to the nearest package root — `skills/mule-development/node_modules` (already gitignored; `--no-save` never touches `package.json`). Run enumeration for every in-scope connector like this:
+
+```bash
+SKILL_PKG="<skill-dir>/.."          # skills/mule-development (nearest package root)
+npm install --no-save --prefix "$SKILL_PKG" fast-xml-parser >/dev/null 2>&1 || true
+
+for nick in $(jq -r '.connectors[].nick' tmp/upgrade-targets.json); do
+  # Prefer the parser; rc=3 means fast-xml-parser wasn't importable → grep fallback.
+  <skill-dir>/scripts/enumerate_usage_xml.mjs "$nick" .
+  [ $? -eq 3 ] && <skill-dir>/scripts/enumerate_usage.mjs "$nick" .
+done
+```
+
+The ephemeral `node_modules` is removed in Step 20. If `npm install` is blocked (offline/locked-down), every parser call exits rc=3 and the grep fallback carries the whole step — no manual intervention needed.
+
+**Usage JSON shape** — both scripts write the identical `tmp/connector-usage/<nick>.json`:
+
+- `operations_used[]` — element names classified as NEW-side operations OR unknown-to-metadata
+- `sources_used[]`, `configs_used[]`, `config_providers_used[]`
+- `child_elements_used[]` — element names classified as known child elements of `<prefix:config>` OR unknown-to-metadata inline child elements (e.g. `content`, `objectContent`, `records`). Surfaced explicitly so grep noise isn't misread as "the flow uses this operation".
+- `usage_sites[]` — per-site `{file, line, attributes_set}`. `doc:name` is filtered out.
+- `errorTypes_caught[]`, `errorTypes_raised[]`
+- `namespace_prefix` — the DSL prefix the flow uses (e.g. `s3` for `<s3:create-object .../>`)
+- `namespace_prefix_changed` — `{from, to}` when the NEW prefix differs from what the flow uses (e.g. SFDC `sfdc` → `salesforce`), otherwise `null`
+
+**Prefix-fallback rule.** If the NEW-metadata prefix doesn't appear as an element opener in any flow XML, the script looks for another `xmlns:<candidate>="<same namespace URI>"` binding in the flow and re-runs the grep with that candidate prefix.
+
+**`not_in_use` skip contract.** If `enumerate_usage.mjs` returns a `not_in_use` JSON for a connector (declared in `pom.xml` but zero flow usage), skip Mode-B and Mode-C for that connector. Keep it in the plan under a `pom-only` section so Phase 2 still runs the pin script. Do NOT invent any other pre-Mode-B/C short-circuit — for every connector with real usage, run Mode-B / Mode-C unconditionally; the "no rewrites" verdict falls out of Step 12's plan synthesis when the per-symbol diffs against Mode-B / Mode-C JSONs come back empty.
+
+**Why Mode-B exists.** The Mode-A summary returns only top-level operation names — no attribute lists, no child elements. Without per-op detail the plan would have to guess NEW-side attribute renames (e.g. `bucketName` → `bucket`) and child-vs-attribute placement (e.g. `<s3:content>` is a childElement in NEW `putObject`, not an attribute) — those guesses only surface at `mvn` time. **Mode-B output shape** — each `tmp/connector-metadata/<nick>-new-<op>.json` contains:
+
+- `attributes[]` — every attribute the NEW operation accepts, keyed on `.attributeName` (NOT `.name`), with types, `required` flag, and `allowedValues`
+- `childElements[]` — every child element the NEW operation accepts (name, prefix, required, attributes)
+- `errorTypes[]` — the per-op error catalog
+- `.output*` keys — populated when the op declares an output type; consumed by Step 9's DW diff
+
+**Before invoking Mode-B**, intersect `usage.operations_used[]` with `<nick>-new.json .operations[]`:
+
+- Op present in `.operations[]` → run Mode-B on it.
+- Op **absent** from `.operations[]` → the op was renamed or removed. Pick the closest rename candidate (Levenshtein-close or same semantic role — e.g. S3 8.x: `createObject` → `putObject`, `readObject` → `getObject`) and run Mode-B on the **candidate**. Log the guessed rename in `tmp/connector-metadata/<nick>-op-renames.json` so Step 12's plan enumerates it explicitly. Never silently skip an op — the flow XML still calls it. A Mode-B call that returns non-zero or empty is itself a strong rename signal (the op likely doesn't exist under that name) — cross-check against `.operations[]` and re-run on the candidate.
+
+**Concrete invocations — flag-based, not positional.** The bundled scripts table (top of file) lists the syntax; repeat here so a subagent doesn't have to scroll:
+
+```bash
+# Mode-B — per operation or source
+<skill-dir>/scripts/describe_connector.mjs <nick>-new --type operation --name <op>
+<skill-dir>/scripts/describe_connector.mjs <nick>-new --type source    --name <src>
+
+# Mode-C — per config-provider (both --name and --config-name are required)
+<skill-dir>/scripts/describe_connector.mjs <nick>-new --type connection-provider --name <provider> --config-name <config>
+```
+
+Passing operation names as positional args (`describe_connector.mjs <nick>-new <op>`) is NOT supported and will trigger a "missing/partial args" exit — a real run in July 2026 burned 2–4 tool calls trial-and-erroring the flag order.
+
+**Why Mode-C exists, and the `--name` / `--config-name` discipline (BLOCKER).** The connection element inside `<prefix:config>` (e.g. `<s3:basic-connection>`, `<jms:active-mq-connection>`) can't be derived from the summary — Mode-A reports only the provider's SDK identifier, not its DSL element name. **`--config-name` and `--name` are the connector's SDK-side identifiers, taken from Mode-A `<nick>-new.json`, NEVER from the flow XML:**
+
+- `--config-name` ← `.configs[].name` (single lower-case word — usually literally `"config"` or `"listenerConfig"`)
+- `--name` ← `.configs[].connectionProviders[]` entry (single lower-case word — e.g. `"oracle"`, `"connection"`, `"active-mq"`, `"listener"`)
+
+Do NOT pass: the user's XML config identifier (`Warehouse_DB_Config` — those go in `config-ref` at call sites); the OLD DSL provider element name (`basic-connection`, `oracle-connection` — those are what Mode-C **returns** in `.elementName`, not what you send); or anything from `tmp/connector-usage/<nick>.json` `configs_used[]` / `config_providers_used[]` (those are populated from OLD flow XML). **Mode-C output shape** — each `tmp/connector-metadata/<nick>-new-<config>-<provider>.json` contains:
+
+- `.elementName` — the config element name (e.g. `sfdc-config`)
+- `.connectionProviders[]` — the connection providers on this config, each with `elementName` (e.g. `basic-connection`), `attributes[]`, and `childElements[]`
+
+Use the `elementName` from this Mode-C file when writing the connection-element rewrite — do not guess from the SDK provider name, and do not read `.elementName` from Mode-A (it isn't there).
+
+**Mandatory fan-out loop — one Mode-B per op, one Mode-C per provider, NO exceptions.** Do not "sample one op per connector" — every op / source / provider in `tmp/connector-usage/<nick>.json` MUST have its own describe file before Step 11.5. Skipping the fan-out leaves Step 12 blind on attribute renames and required-attribute additions; Step 16's retry loop then burns its whole budget guessing.
+
+Execute the fan-out for every connector via this loop (paste verbatim — do not re-implement it inline). It is idempotent — an existing `<nick>-new-<op>.json` is skipped, so re-running after a partial run is cheap:
+
+```bash
+for usage in tmp/connector-usage/*.json; do
+    nick="$(basename "$usage" .json)"
+    status="$(jq -r '.status // ""' "$usage")"
+    [ "$status" = "not_in_use" ] && continue
+
+    modeA="tmp/connector-metadata/${nick}-new.json"
+    [ -f "$modeA" ] || { echo "❌ Mode-A missing for $nick — re-run Step 7a"; exit 1; }
+
+    # Mode-B per operation (intersect with Mode-A .operations[])
+    for op in $(jq -r '.operations_used[]? // empty' "$usage"); do
+        known="$(jq -r --arg n "$op" '[.operations[]? | if type == "string" then . else .name end] | index($n) // "none"' "$modeA")"
+        if [ "$known" = "none" ]; then
+            echo "⚠️  $nick/$op — op absent from Mode-A .operations[] (rename/removed); Step 12 must consult <nick>-op-renames.json"
+            continue
+        fi
+        out="tmp/connector-metadata/${nick}-new-${op}.json"
+        [ -f "$out" ] && continue
+        <skill-dir>/scripts/describe_connector.mjs "${nick}-new" --type operation --name "$op"
+    done
+
+    # Mode-B per source
+    for src in $(jq -r '.sources_used[]? // empty' "$usage"); do
+        out="tmp/connector-metadata/${nick}-new-${src}.json"
+        [ -f "$out" ] && continue
+        <skill-dir>/scripts/describe_connector.mjs "${nick}-new" --type source --name "$src"
+    done
+
+    # Mode-C per (config, provider) — driven from Mode-A .configs[], per the
+    # "--name / --config-name discipline" block above.
+    # Do NOT drive from usage.configs_used[] / config_providers_used[]: those
+    # hold flow-instance names (config-ref values like db-config-primary, and
+    # camelCase child names like genericConnection) that never equal Mode-A's
+    # SDK names (config, generic) — the old join matched nothing and silently
+    # wrote zero Mode-C files, so Phase C never saw reparenting like db's
+    # <pooling-profile> and the first mvn broke on XSD validation.
+    # --config-name ← .configs[].name; --name ← .configs[].connectionProviders[]
+    # entry. Configs with an empty connectionProviders[] are skipped (D7
+    # fallback — Phase C reads Mode-A .configs[] directly there).
+    jq -r '.configs[]? as $cfg
+             | $cfg.connectionProviders[]?
+             | "\($cfg.name)\t\(if type == "string" then . else (.name // .elementName) end)"' "$modeA" \
+      | while IFS=$'\t' read -r cfg prov; do
+        [ -z "$cfg" ] && continue
+        [ -z "$prov" ] && continue
+        out="tmp/connector-metadata/${nick}-new-${cfg}-${prov}.json"
+        [ -f "$out" ] && continue
+        <skill-dir>/scripts/describe_connector.mjs "${nick}-new" --type connection-provider --name "$prov" --config-name "$cfg"
+    done
+done
+```
+
+**Post-condition (self-check) — must pass before Step 7 declares "done".** Do not defer this to Step 11.5:
+
+```bash
+<skill-dir>/scripts/verify_metadata_coverage.mjs || { echo "❌ Mode-B/C fan-out incomplete — re-run the loop above until coverage passes"; exit 1; }
+```
+
+If `verify_metadata_coverage.mjs` prints FAIL rows, re-run the fan-out loop for just those `(nick, op)` / `(nick, cfg, prov)` pairs. The loop is idempotent — it only re-invokes describe when the target file is missing.
+
+**After Mode-B / Mode-C complete**, run these mandatory diffs (they feed Step 12's Phase-C completeness checklist):
+
+- Mode-B `.attributes[].attributeName` (NOT `.name`) vs `usage.usage_sites[].attributes_set` keys → attribute renames
+- `usage.errorTypes_caught[]` vs Mode-B `.errorTypes[]` ∪ Mode-A `.errorTypes[]` → error-type renames (**mandatory**, not opportunistic — deferring these to build-time self-correction consumes retry budget)
+- **Mode-C `.connectionProviders[].elementName` (the whole set for the connector) vs the OLD flow's `<prefix:config>` connection-element local-name → provider-element rename.** This is the provider element's OWN name changing, not its child-tree — the child-tree bullet below yields zero residue when the provider's children are unchanged, so it will NOT catch this. Test = **set membership after case-normalizing** (Mode-C `elementName` is kebab-case, `usage.config_providers_used[]` is camelCase — fold both to one form before comparing, else a connector that did NOT rename false-positives): if the OLD local-name is **absent from the union of NEW `elementName`s** for that connector, the provider was renamed → plan the `<prefix:config>` child rewrite to the surviving element. A missed provider rename is a guaranteed `process-classes` XSD failure.
+- Mode-C child-tree diff — **recursive**, at BOTH scopes:
+  - `.childElements[]` (config-level, walked recursively into every nested `.childElements[]` / `.containedElements[]`) vs OLD flow config-child tree
+  - `.connectionProviders[].childElements[]` (provider-level, walked recursively) vs OLD flow provider-child tree
+  Catches reparenting between config ↔ provider (e.g. `mule-db-connector` 1.16.x moves `<db:pooling-profile>` from `<db:config>` child to `<db:oracle-connection>` child) AND catches nested-structure diffs like `<vm:queues><vm:queue …/></vm:queues>` where the whole subtree lives under a config-level child, not a provider. Do not stop at the top-level names — a rename or restructure two levels deep will be missed.
+
+Every diff residue MUST appear in Step 12's plan (`tmp/upgrade-plan.md`) as an explicit per-symbol edit.
 
 - Describe connector operations for version changes
 - Identify changes to operations, configs, error types
@@ -383,7 +630,32 @@ It writes `tmp/target-connectors.json` and **exits 1 when `stop: true`**. Read i
 
 ## Step 9: Check DataWeave Compatibility
 
-(To be implemented)
+**No scripts for this step.** The agent reads DW sources directly at plan-synthesis time (Step 12) using the `Read` tool. Compare symbols against Mode-B `.output*` keys from `tmp/connector-metadata/<nick>-new-<op>.json`:
+
+- Symbols present in Mode-B → no change
+- Symbols absent, sibling present → propose a rewrite in the plan
+- Symbols absent AND Mode-B has NO `.output*` keys → mark as `SITE FLAGGED FOR OPERATOR`
+
+Sources to read:
+- Every `<ee:transform>` block under `src/main/mule/**/*.xml`
+- Every inline `#[...]` expression under `src/main/mule/**/*.xml`
+
+**Java 17 upgrade patterns — check every DW file (inline + `.dwl` under `src/main/resources/**`) for these eight, and add each hit to the plan under "DataWeave downstream impact":**
+
+1. **`as Number` / `as Integer` on external strings** — Java 17's `NumberFormat` rejects thousands separators and whitespace that Java 8 tolerated. Wrap with a `sanitizeNumeric()` helper (strip `,` and trim) before the cast.
+2. **`sizeOf(x as Object)` / `keysOf(x as Object)` / any `as Object` on a Map or Array** — the `as Object` cast used to opaque-wrap the value; Java 17 + newer DW rejects it. Drop the cast.
+3. **`now() + <Number>` / `<DateTime> + <Number>`** — implicit Number→Period coercion is gone. Convert to an explicit period literal, e.g. `now() + |P7D|` or `now() + |PT1H|`.
+4. **`formatDate(x, pattern)` / `parseDate(s, pattern)` without `{locale: ...}`** — JEP 252 flipped the default locale provider to CLDR; month/day names drift. Add `{locale: "en-US"}` (or the app's canonical locale) explicitly.
+5. **Hardcoded reliance on `Charset.defaultCharset()`** or reading/writing files without an explicit charset — JEP 400 flipped the JVM default to UTF-8. Pin the charset explicitly on every read/write.
+6. **`dw::Runtime::run(..., engine: "javascript")` or any Nashorn callout** — JEP 372 removed Nashorn. Rewrite in native DW (`reduce`, `map`, etc.); if the logic genuinely needs a JVM callout, use `java!` and audit that path against pattern 7.
+7. **`java!` prefix into `sun.*` / `jdk.internal.*` / any encapsulated JDK internals** — JEP 403 hard-blocks reflective access to JDK internals. Rewrite using DataWeave native representations (locale as `{language, country}` map, timezone as canonical ID string).
+8. **Three-letter timezone identifiers** (`"PST"`, `"CST"`, `"EST"`, `"PST8PDT"`) — tzdb drift + ambiguous mappings. Replace with canonical IANA IDs (`"America/Los_Angeles"`, `"America/Chicago"`, `"America/New_York"`).
+
+The model already knows the fix for each pattern from public Java-17 migration guides — you don't need a bundled scanner script. Read each DW source with the `Read` tool, apply the checklist inline, and record every hit as `file:line — pattern-N — proposed fix` in Step 12's plan.
+
+The connector-specific coercion checks (`as Number` on a connector op's payload, `now() as String` for a connector attribute, `error.errorType.identifier` against Mode-B error catalog) also happen during this same read pass — no separate scan.
+
+This step is **discovery only** — grep/read the DW sources, flag every mismatch, but make **no edits** here (Phase 1 writes nothing to project files). Findings roll into the plan's "DataWeave downstream impact" section, authored in Step 12; the actual DW rewrites happen in Step 15.
 
 - Identify DataWeave scripts in flows
 - Check for Java version incompatibilities
@@ -393,7 +665,14 @@ It writes `tmp/target-connectors.json` and **exits 1 when `stop: true`**. Read i
 
 ## Step 10: Check MUnit Compatibility
 
-(To be implemented)
+**No scripts for this step.** The agent reads every `src/test/munit/**/*.xml` directly at plan-synthesis time (Step 12) using the `Read` tool. For each operation the plan will rewrite, flag:
+
+- `<munit-tools:mock-when processor="<old-op>">` → rename plan entry
+- `<munit-tools:then-return>` payload shapes → schema-mismatch flag
+- `<munit-tools:assert-that>` reading op-response fields → cross-reference DW flags
+- `<on-error-propagate type="...">` in MUnit error paths → apply error-type map from the plan
+
+This step is **discovery only** — grep/read the tests and flag every mismatch, but make **no edits** here. Findings roll into the plan's "MUnit downstream impact" section, authored in Step 12. Actual test edits happen in Step 15 and are validated by Step 17 (`mvn test`).
 
 - Identify MUnit test files
 - Check for connector operation changes that impact tests
@@ -411,9 +690,147 @@ It writes `tmp/target-connectors.json` and **exits 1 when `stop: true`**. Read i
 
 ---
 
+## Step 11.5: Verify Metadata Coverage (gate)
+
+Run the coverage gate before touching Step 12. It cross-references every op / source / provider in `tmp/connector-usage/*.json` against the Mode-A / Mode-B / Mode-C JSONs on disk and refuses to advance the plan if any required describe is missing.
+
+```bash
+<skill-dir>/scripts/verify_metadata_coverage.mjs
+```
+
+Behavior:
+
+- **FAIL** (exit 1) — a required Mode-B or Mode-C JSON is missing on disk for an op/provider that IS present in Mode-A. Re-run `describe_connector.mjs` for those (op, provider) pairs, then re-run this gate.
+- **WARN** — an op/provider appears in `usage_sites` but is NOT in Mode-A `.operations[]` / `.configs[].connectionProviders[]`. Usually a rename or removal; Step 7 should have written `<nick>-op-renames.json` with the candidate. Non-fatal by default — pass `--strict` to fail on WARN rows too.
+- **INFO** — the connector is `not_in_use`, OR a used config has zero declared providers in Mode-A (D7 fallback). Phase C consumes Mode-A `.configs[]` directly for the empty-provider case; no Mode-C is required.
+
+Do not proceed to Step 12 until this gate exits 0. A blind plan built on a missing per-op describe silently ships a "no rewrites needed" verdict for whatever the missing JSON would have revealed.
+
+---
+
 ## Step 12: Present Plan & Get Approval
 
-(To be implemented)
+This is the plan-authoring step and the hard approval gate. No CLI calls, no scripts — the LLM reads the metadata + usage JSON already on disk and writes an explicit, **mechanical, per-symbol** change list to `tmp/upgrade-plan.md`. Everything Execution will do to the project must appear in this file so the user can approve or reject each edit before it touches the working tree. The plan MUST describe **exactly which `file:line` changes to what** — never intent ("update the s3 operations").
+
+Concrete flow for this step:
+
+### 12.1 Completeness checklist (run BEFORE authoring the plan)
+
+Every connector must have all four artifacts on disk, fully cross-checked against usage, before a plan is presented:
+
+- [ ] `tmp/connector-choices/<nick>-new.json` — drafted GAV
+- [ ] `tmp/connector-metadata/<nick>-new.json` — Mode-A summary
+- [ ] `tmp/connector-metadata/<nick>-new-<op>.json` — Mode-B per-op **for every op in `usage.operations_used[]` that intersects `new.operations[]`**
+- [ ] `tmp/connector-metadata/<nick>-new-<config>-<provider>.json` — Mode-C **for every (config, provider) pair the flow uses**
+
+Step 11.5's `verify_metadata_coverage.mjs` gate already ran the mechanical version of this presence check; if it exited 0 the artifacts are all present. If any artifact is missing, loop back to Step 5/6/7 and do **not** present a partial plan. Step 7's mandatory diffs (attribute-rename, error-type, provider-element set-membership, recursive child-tree) must already be complete — this checklist confirms their residues all landed as plan bullets below. **If any diff surfaces a symbol the plan does not enumerate, that plan is incomplete — go back to Step 7, re-describe, and re-synthesize.** "Build breaks after the skill claims success" is almost always metadata-present-but-ignored.
+
+### 12.2 Resolve renames from the data you already have
+
+**Do not defer to Step 16.** Every WARN row emitted by Step 11.5 is a rename signal (`WARN <nick>/<op-or-provider> — not in Mode-A ...`). For each WARN:
+   - **Op renames**: cross-reference `tmp/connector-metadata/<nick>-new.json` `.operations[]` (all new op names). Pick the semantically closest match to the old op name and confirm by reading its Mode-B `tmp/connector-metadata/<nick>-new-<newOp>.json` `.attributes[]` — does the new op accept the attributes the flow XML sets on the old element? If yes, encode the rewrite as a plan bullet: `Rewrite <ns>:<oldOp> → <ns>:<newOp>` with attribute deltas listed inline (renamed, removed, newly-required).
+   - **Provider renames**: cross-reference Mode-A `.configs[].connectionProviders[]` (all new provider names for that config) and read the Mode-C describe `tmp/connector-metadata/<nick>-new-<config>-<newProvider>.json` for each candidate. Pick the new provider whose attributes best cover what the flow XML sets on the old provider element (grep the flow XML: `grep -c 'ns:oldProvider' src/main/mule/*.xml` and then list its attributes). Emit `Rewrite <ns>:<oldProvider> → <ns>:<newProvider>` with attribute deltas.
+   - The LLM already has every input needed — old names (from `tmp/connector-usage/<nick>.json` `.config_providers_used[]` / `.operations_used[]`), new names (from Mode-A `.operations[]` / Mode-A `.configs[].connectionProviders[]`), and per-target attribute shape (from Mode-B / Mode-C JSONs). No new script, no new AskUserQuestion — just synthesize the rename bullets into `tmp/upgrade-plan.md` before presenting it. Halt via `AskUserQuestion` only if a match is genuinely ambiguous (2+ new candidates with equal attribute coverage).
+   - **Required-attribute additions** — beyond renames, diff each used op / provider / config's Mode-B/Mode-C `.attributes[]` where `required: true` against the attributes actually set on the corresponding element in flow XML. For every new-required attribute not present in the current flow XML:
+     - If `.default` is set → emit `Add <ns>:<element> @<attr>="<default>"` (Example: crypto 2.x `<crypto:jce-config>` now requires `type` with `.default = "JCEKS"` → plan bullet `Add crypto:jce-config @type="JCEKS"`).
+     - Else if `.type == "enum"` → pick `.values[0]` and note it in the bullet as `(picked first enum value; verify)`.
+     - Else → surface as an `AskUserQuestion` bullet (`Connector <nick> op/provider <name> requires new attribute <attr> (<type>) — please supply a value`) before finalizing the plan.
+   - This catches the "XSD says attribute X is required and you didn't set it" class of failure at plan time using Mode-B/C data you already fetched, instead of letting Step 16 burn retries reverse-engineering enum values from mvn error text.
+
+### 12.3 Author `tmp/upgrade-plan.md`
+
+Write `tmp/upgrade-plan.md` with the rename bullets from 12.2 folded in. Plan **inputs** (all already on disk): `tmp/upgrade-targets.json` (from/to for mule, java, connectors), `tmp/connector-metadata/<nick>-new.json` (Mode-A), `…-new-<op>.json` (Mode-B, with `attributes[]`, `childElements[]`, `errorTypes[]`, `.output*`), `…-new-<config>-<provider>.json` (Mode-C), `tmp/connector-usage/<nick>.json` (usage sites, `attributes_set`, errorTypes caught/raised, `namespace_prefix_changed`). Every section MUST cite the specific JSON file(s) it derives from — reviewers verify a plan by cross-checking citations.
+
+```markdown
+# Upgrade Plan — <project-name>
+
+## Targets
+- Mule runtime: <from> → <to>
+- Java: <from> → <to>
+- Connectors:
+  - <nick>: <old-gav> → <new-gav>   [Java window verdict: ok | warn | block-handled]
+
+## Namespace prefix changes
+- <nick>: <old-prefix> → <new-prefix>   (source: usage.namespace_prefix_changed)
+
+## Operations
+For each op the flow uses:
+
+### <op-name> (op_OLD → op_NEW)
+- Kind: straight-match | rename | true-removal
+- Sources: usage.operations_used[], per-op JSON (<nick>-new-<op>.json)
+- Sites (from usage.usage_sites[]):
+  - <file>:<line>   attributes_set: [a="…", b="…"]
+- Per-site edit contract:
+  - Element rename: <old-prefix>:<old-op> → <new-prefix>:<new-op>
+  - Attribute renames:
+    - `bucketName` → `bucket`
+    - `content`    → PROMOTE TO CHILD ELEMENT `<s3:content>#[payload]</s3:content>`
+      (source: <nick>-new-<op>.json .childElements[])
+  - Removed attributes:
+    - `useVersioning` — dropped
+  - New required attributes/children:
+    - <name> (required=true, defaultValue=<x>) — insert with default
+- Error-type mapping (per-op):
+  - S3:BUCKET_NOT_FOUND → S3:NO_SUCH_BUCKET   (source: <nick>-new-<op>.json .errorTypes[])
+
+## Configs / connection providers
+For each (config, provider) pair the flow uses:
+
+### <config-nick> (<config-name>, provider <provider-name>)
+- Sources: <nick>-new-<config>-<provider>.json
+- Config element:  <old-prefix>:<old-config-element> → <new-prefix>:<.elementName>
+- Connection element:  <old-prefix>:<old-connection-element> → <new-prefix>:<.connectionProviders[…].elementName>
+- Attribute renames (on the connection element)
+- Removed connection attributes / Added required connection attributes-children
+- Sites (from usage.usage_sites[])
+
+## Connector-wide error type renames
+Enumerated from <nick>-new.json .errorTypes[]:
+- <OLD_TYPE> → <NEW_TYPE>
+
+## DataWeave downstream impact
+For every DW consumer that reads output from an op the plan will rewrite:
+- Symbol list read from the op's response
+- Diff against Mode-B .output* keys:
+  - Present in Mode-B: no change
+  - Absent, sibling present (probable rename): proposed rewrite (with source citation)
+  - Absent AND Mode-B has NO .output* keys: SITE FLAGGED FOR OPERATOR
+
+## pom.xml / mule-artifact.json
+- <app.runtime>: <from> → <to>
+- <javaVersion> / maven.compiler.{source,target}: <from> → <to>
+- <mule.maven.plugin.version>: bumped per references/runtime-bump-matrix.md
+- mule-artifact.json:
+  - minMuleVersion: <from> → <to>
+  - javaSpecificationVersions: add ["<to>"] if target is 17 or 21 and the field is absent
+
+## xsi:schemaLocation URLs
+- apply_connector_pin.mjs will rewrite mule-<connector>.xsd URLs deterministically
+
+## Known risks / operator-attention items
+- Java-window warnings, DW sites flagged for operator, true-removal ops with no rename target, etc.
+```
+
+Authoring rules:
+
+- **Never invent an operation, attribute, or child element.** Every rename claim must have a corresponding entry in a Mode-B / Mode-C JSON on disk.
+- **Preserve business intent in the plan.** `doc:name`, DataWeave payloads, `config-ref` values, error-handler shapes are not part of the upgrade; they must survive Execution unchanged. Note it explicitly in the plan when a site has DW / config-ref / doc:name so reviewers can spot an accidental drop.
+- **Flag ambiguity.** If an OLD op has no plausible NEW rename target, mark the site as `true-removal — operator attention required`. Do NOT silently guess. If a DW site has no Mode-B `.output*` shape catalog, list every symbol read and flag the site for operator confirmation.
+
+### 12.4 Present and gate
+
+1. `Read` the file `tmp/upgrade-plan.md` (with the rename bullets folded in).
+2. Print its full contents inline in the response as fenced markdown so the user can review without opening another file.
+3. Use `AskUserQuestion` with three options:
+   - `Yes, proceed to Execution`
+   - `No, I want to change the plan`
+   - `No, cancel the upgrade`
+4. **WAIT for the explicit "Yes, proceed to Execution."** before advancing to Step 13.
+
+On `No, change`: collect specifics via a follow-up `AskUserQuestion`, loop back to the affected step (5/6/7/9/10), re-synthesize the plan, re-present. Do NOT rerun Step 1.
+
+On `No, cancel`: stop the workflow. Leave `tmp/` in place for inspection.
 
 - Display all version updates
 - Show connector version changes
@@ -428,7 +845,37 @@ It writes `tmp/target-connectors.json` and **exits 1 when `stop: true`**. Read i
 
 ## Step 13: Download Runtime and Java
 
-(To be implemented)
+This step is a thin gate that verifies Java 17 is installed locally and that a Mule Runtime ≥ 4.9.x is registered with the Anypoint CLI.
+
+```bash
+/usr/libexec/java_home -v 17
+```
+
+If the command exits non-zero, HALT and prompt the user with `AskUserQuestion`:
+
+> "Java 17 is not installed. Install Azul Zulu 17 (preferred over Microsoft OpenJDK 17 for SFDC Nexus TLS compatibility) via `brew install --cask zulu@17`, then `export JAVA_HOME=$(/usr/libexec/java_home -v 17)` and re-run this step."
+
+**Why an introspection runtime is needed (and why ≥ 4.9).** `anypoint-cli-v4 dx mule describe-connector` (the engine behind every Mode-A/B/C call in Step 7, and the lazy single-connector re-describe in Step 16 class 6) needs a locally installed Mule Runtime to load the connector's bundled poms. This is **independent of the app's target runtime** — the app may still target 4.6.x for deploy; the CLI just needs a **4.9+** distribution as its introspection substrate. Runtimes older than 4.9 fail with a silent `Java exited with code 1`, because the JAR bundled in the CLI plugin calls `mule-runtime-ast.ErrorTypeBuilder.builder()`, a static method that only exists in Mule 4.9+.
+
+Verify the Mule Runtime path used by describe-connector:
+
+```bash
+cat ~/.mule-dx/config.json 2>/dev/null | jq -r '.runtimePath // empty'
+```
+
+If empty or points at a Mule < 4.9.x install, HALT and set a 4.9+ path (one-time; persists in `~/.mule-dx/config.json`):
+
+> "anypoint-cli-v4 dx mule runtime path --set ~/AnypointCodeBuilder/runtime/mule-enterprise-standalone-4.11.2"
+
+**If describe-connector fails silently later**, capture the real exception (the `Java exited with code 1` message hides it):
+
+```bash
+_JAVA_OPTIONS='-Dmule.jvm.version.extension.enforcement=LOOSE -Xlog:exceptions*=info:file=/tmp/xlog.log' \
+  anypoint-cli-v4 dx mule describe-connector --connector <groupId>:<artifactId>:<version> --output json
+grep -E "NoSuchMethodError|doesn't support|ClassNotFoundException" /tmp/xlog.log | head -5
+```
+
+A `NoSuchMethodError` on `ErrorTypeBuilder.builder()` confirms a < 4.9 runtime path — fix it with the `--set` command above.
 
 - Download target Java version (if Java upgrade)
 - Download target MRT (if MRT upgrade)
@@ -438,7 +885,26 @@ It writes `tmp/target-connectors.json` and **exits 1 when `stop: true`**. Read i
 
 ## Step 14: Update Files - Versions Only
 
-(To be implemented)
+Deterministic version rewrites — each script call in its own `Bash` response. Order matters: promote drafts → runtime bump → per-connector pin.
+
+```bash
+<skill-dir>/scripts/promote_new_connector_pins.mjs
+<skill-dir>/scripts/apply_runtime_bump.mjs .
+```
+
+`apply_runtime_bump.mjs` exits 2 if the running JDK does not match `tmp/upgrade-targets.json .java.to`. Hand its stdout instruction to the user via `AskUserQuestion` verbatim and WAIT for confirmation before continuing.
+
+Then per connector:
+
+```bash
+for nick in $(jq -r '.connectors[].nick' tmp/upgrade-targets.json); do
+  <skill-dir>/scripts/apply_connector_pin.mjs "$nick" .
+done
+```
+
+**No re-describe here.** Plan Phase already introspected every pinned connector into `tmp/connector-metadata/<nick>-new.json` (Step 7), and that is the file every downstream reader consumes — `apply_connector_pin.mjs` (namespace), `verify_metadata_coverage.mjs` (the coverage gate), and Step 16 classes 1–5. A second describe of the pinned connector (writing the no-suffix `<nick>.json`) is only ever read by Step 16's **class 6** recovery (`xsi:schemaLocation` 404), which almost never fires — so re-describing all N connectors unconditionally here spends N Java-17 CLI calls to populate a file that a green build never opens. **It is therefore done lazily**: Step 16 class 6 re-describes the single failing connector on demand if and only if a schema-URL failure needs the pinned-namespace ground truth. See Step 16 · 16.1 · class 6.
+
+The fixed order above (promote drafts → runtime bump → per-connector pin) **is** the pre-build preparation — no separate validator pass is needed before Step 16's `mvn`. `apply_connector_pin.mjs` owns the `xsi:schemaLocation` rewrite deterministically (one call per connector nickname); never hand-edit those URLs. `apply_runtime_bump.mjs` reads `.mule.to` / `.java.to` from `tmp/upgrade-targets.json` and bumps `pom.xml` (`<app.runtime>`, `<javaVersion>`, `maven.compiler.{source,target}`, `<mule.maven.plugin.version>` per `references/runtime-bump-matrix.md`) plus `mule-artifact.json` (`minMuleVersion`, `javaSpecificationVersions`).
 
 - Update mule-artifact.json (minMuleVersion, javaSpecificationVersions)
 - Update pom.xml (runtime version, Java version, connector versions, plugin versions)
@@ -448,9 +914,52 @@ It writes `tmp/target-connectors.json` and **exits 1 when `stop: true`**. Read i
 
 ## Step 15: Update Application Code
 
-(To be implemented)
+Apply the edits enumerated in `tmp/upgrade-plan.md` **mechanically** — no new discoveries, no new choices. Everything that could require user input was resolved during planning. Use `references/llm-prompts.md §1` verbatim as the per-op model prompt (it is self-contained per operation, so it doesn't need to re-open files).
 
-Update application code based on analysis from Phase 1:
+**Global constraints (apply to every edit below):**
+- Preserve business intent — `doc:name`, DataWeave payloads, `config-ref` values, error-handler shapes must survive unchanged.
+- Never modify unrelated elements.
+- Never invent an operation, attribute, or child element that isn't in the plan / Mode-B / Mode-C JSON.
+- Never edit `xsi:schemaLocation` — the deterministic `apply_connector_pin.mjs` (Step 14) owns it.
+- Never re-open a decision the plan already made — if a decision looks wrong, HALT and route back to Step 12.
+
+### 15.1 Flow-XML edits (plan §Operations + §Configs)
+
+**Per-operation** — for each op in the plan:
+
+1. If the op is `true-removal — operator attention required`, use `AskUserQuestion` at edit time to confirm the manual rewrite path. Never guess a rename here; that decision belongs in the plan.
+2. Open `usage_sites[i].file` at its `line` with the `Read` tool (grab ~10 lines each side for context).
+3. `Edit` the element in place per the plan's contract: element rename (prefix + local-name); attribute renames from `.attributes[].attributeName`; attribute → child-element promotions from `.childElements[]`; drop removed attributes; insert new-required attributes/children with the plan's default; rewrite `<on-error-propagate type="…">` / `<on-error-continue type="…">` per the plan's error-type map.
+4. **Preserve** `doc:name`, DataWeave payloads, `config-ref` values, and other unrelated children.
+5. If the namespace prefix changed, update the `xmlns:<oldprefix>` → `xmlns:<newprefix>` binding on the flow's root `<mule>` element. Do NOT touch `xsi:schemaLocation`.
+6. After all sites for the op are edited, run `xmllint --noout <file>` on each touched file to verify parseability.
+
+**Per-config** — for each (config, provider) pair in the plan:
+
+1. Rewrite the config element's local-name to the plan's Mode-C `.elementName`.
+2. Rewrite the connection element's local-name to the plan's provider `.elementName` from Mode-C.
+3. Apply the attribute renames on the connection element from the plan.
+4. If the namespace prefix changed, rewrite the config's element prefix — the local-names above are unchanged.
+
+### 15.2 DataWeave edits (plan §DataWeave downstream impact)
+
+Apply exactly the DW rewrites enumerated in the plan:
+- Sites where the plan proposes a rewrite (Mode-B `.output*` gave a sibling-rename mapping) → apply the `Edit` as written.
+- Sites flagged `SITE FLAGGED FOR OPERATOR` → the plan couldn't determine a shape mapping. Surface via `AskUserQuestion` at edit time — do NOT silently rewrite.
+
+Connector-specific hot spots to sanity-check even when the plan didn't flag them: `db:select` column-case flips across driver versions; Java 17 stricter number/date coercion (`as Number`, `now() as String`); `error.errorType.identifier` string content changes (`SFDC:…` → `SALESFORCE:…`, etc.).
+
+### 15.3 MUnit edits (mirror the plan's §Operations + §DataWeave downstream impact + §Connector-wide error type renames)
+
+MUnit has no dedicated plan section — its edits fall out of the same op renames, output-shape changes, and error-type renames the flow edits use. For every op the plan will rewrite, review each `src/test/munit/**.xml` that references it:
+- Update `<munit-tools:mock-when>` `processor` attributes to the NEW element name (e.g. `processor="salesforce:query"`).
+- Update mocked `<munit-tools:then-return>` payload shape if Mode-B `.output*` indicates a schema change.
+- Update `<munit-tools:assert-that>` expressions that read op-response fields flagged in the plan's DW section.
+- Update `<munit-tools:fail>` and `<on-error-propagate type="…">` in MUnit error paths per the plan's error-type map.
+
+`mvn test` (Step 17) is the authoritative gate for these edits.
+
+Summary of what Step 15 touches:
 
 - Update flows for connector operation changes (based on Step 7 analysis)
 - Update configuration components for config changes
@@ -464,17 +973,111 @@ Use metadata from `describe-connector` to ensure operations, configs, and attrib
 
 ## Step 16: Build Loop
 
-(To be implemented)
+Bounded recovery loop with a **3-retry** cap. `mvn clean package` BUILD SUCCESS is packaging-only — it validates that (a) XSDs parse, (b) DataWeave compiles, (c) the `.jar` packages. It does NOT execute any flow, hit any external system, or run MUnit. Step 17 (`mvn test`) is the real runtime gate.
 
-- Run `mvn clean package -DskipTests`
-- If build fails, parse errors and fix remaining issues
-- Repeat until build succeeds
+- Run `mvn clean package -DskipTests 2>&1 | tee tmp/mvn-failures/build-<attempt>.log`
+- If BUILD SUCCESS → advance to Step 17.
+- If BUILD FAILURE → **do not ad-hoc patch.** Enter the classifier below (16.1). Almost every mvn failure is an XSD/DSL mismatch whose fix is already in the metadata collected during Plan Phase (Mode-A / Mode-B / Mode-C JSON) — structured recovery reuses that data instead of re-guessing. Apply **one** targeted edit, then re-run `mvn` in a NEW response.
+
+### 16.1 Failure classifier — parse, classify, fix from metadata
+
+**Parse the failure** — extract from the Maven output (save the raw output to `tmp/mvn-failures/<attempt>.log`):
+
+| Field | Where it appears | Example |
+|---|---|---|
+| `file` | `[ERROR] Could not load flow: file:.../src/main/mule/<flow>.xml` | `/…/src/main/mule/example.xml` |
+| `line`, `col` | `cvc-*: … [file:line:col]` or `line N column M` | `line 23 column 4` |
+| `error_code` | `cvc-complex-type.<N>.<N>` / `cvc-enumeration-valid` / `cvc-datatype-valid.1.2.1` | `cvc-complex-type.3.2.2` |
+| `element` | The `<prefix:name>` in the message | `<salesforce:basic-connection>` |
+| `attribute` | The attribute (if any) named in the message | `securityType` |
+| `expected` | For enum/type errors, allowed values | `[BASIC_AUTH, OAUTH_JWT, ...]` |
+
+**Classify** into one of these classes and fix from the cited metadata:
+
+1. **attribute-rename** — `cvc-complex-type.3.2.2` "Attribute '<X>' is not allowed to appear in element '<prefix:op>'". Fix source: `tmp/connector-metadata/<nick>-new-<op>.json` → `.attributes[].attributeName`. Recovery: find a plausible NEW attribute (Levenshtein-close or same semantic role) and edit the site; if the plan already picked a mapping, apply the plan's.
+2. **missing-required-child** — `cvc-complex-type.2.4.a/b` "Invalid content was found starting with element '…'. One of '{…}' is expected". Fix source: `…-new-<op>.json` → `.childElements[]`. Recovery: an OLD attribute (e.g. `content="#[payload]"`) is now a child element (`<prefix:content>#[payload]</prefix:content>`) — rewrite accordingly.
+3. **element-rename** — `cvc-elt.1.a` "Cannot find the declaration of element '<prefix:op>'". Fix source: `<nick>-new.json` → `.operations[]` / `.sources[]`. Recovery: if the plan already picked a rename target, apply it; otherwise the plan missed the rename — go back to Step 12, do NOT guess.
+4. **connection-provider element name** — same code shape as (3) but inside a `<prefix:config>` block. Fix source: `…-new-<config>-<provider>.json` → `.elementName` (config) and `.connectionProviders[] | select(.name == "<provider>") | .elementName` (connection). Recovery: rewrite to Mode-C's `.elementName`. Bounded and deterministic — never guess from the SDK identifier.
+5. **enum-value** — `cvc-enumeration-valid` "Value '<X>' is not facet-valid with respect to enumeration '[…]'". Fix source: the parsed message carries allowed values; cross-reference the per-op JSON's `.attributes[].allowedValues`. Recovery: pick the NEW enum value that maps to the OLD one (usually a rename — `BASIC` → `BASIC_AUTH`), or `AskUserQuestion` if genuinely ambiguous.
+6. **xsi:schemaLocation URL** — `SAXException` "schema_reference.4" or `cvc-elt.1.a` on the `<mule ...>` root, with a `.../current/mule-<name>.xsd` URL that 404s. Fix source: `tmp/connector-versions/<nick>.json` (pinned GAV) + the **pinned-namespace ground truth** for the failing connector. That ground truth is the no-suffix `tmp/connector-metadata/<nick>.json`, which is NOT written up front (Step 14 no longer re-describes every connector). Re-describe the **one** failing connector now, on demand — Java 17+ required, same as Step 7 (`$JAVA_HOME` should still be set from Step 13; verify with `java -version` first):
+   ```bash
+   <skill-dir>/scripts/describe_connector.mjs "<nick>"        # no -new suffix → writes tmp/connector-metadata/<nick>.json
+   ```
+   Then read `<nick>.json` → `.namespace.uri`. Recovery: re-run `apply_connector_pin.mjs <nick> .` (it reads `<nick>-new.json` for the namespace and rewrites the URL deterministically). Do NOT hand-edit `xsi:schemaLocation`.
+7. **pom / plugin / runtime** — anything from the reactor before the app loads (`mule-maven-plugin` not found, `${app.runtime}` unresolved, `javaSpecificationVersions` mismatch, missing artifact in the local repo). Fix source: `references/runtime-bump-matrix.md`; `pom.xml` + `mule-artifact.json`; `tmp/connector-versions/*.json`. Recovery: re-run `apply_runtime_bump.mjs .` (runtime/plugin property wrong) or `apply_connector_pin.mjs <nick> .` (dependency version wrong). Only hand-edit `pom.xml` when both scripts report `not-found`.
+8. **unknown / other** — doesn't fit the classes above. Fix source: cross-reference `tmp/connector-metadata/*.json` + `tmp/connector-versions/*.json` with Mule 4 XSD/DSL semantics. Recovery: revisit whichever earlier phase's output the failure implicates; log reasoning in `tmp/mvn-failures/<attempt>.log`. Fall through to `AskUserQuestion` only once the 3-retry budget is exhausted OR the same knowledge-based edit has already failed once.
+
+Apply **one** targeted edit per retry (one `Edit`, or the ONE script re-run named in the recovery step) — do not batch. Re-run `mvn clean package` in a NEW response. On success → Step 17; on failure → increment the retry counter and re-parse.
+
+### Diagnostic escalation ladder — MANDATORY on opaque failures
+
+A "guess-fix-retry" loop that only reads the terse mvn line burns retries when the error message doesn't point at the offending file. Two failure modes are especially opaque and MUST trigger an escalation probe **before** the next code edit — not after a wasted retry.
+
+**Trigger A — XSD "invalid content" on a pinned connector's operation/element.**
+Symptom: `cvc-complex-type.2.4.a: Invalid content was found starting with element '<ns>:<op>'`.
+Meaning: the flow XML calls an op that the *resolved* XSD doesn't declare. The pom pin may not have taken effect (stale local repo, transitive pin from parent POM, `current/` alias resolving to old version).
+
+Before editing anything, run:
+```bash
+mvn dependency:tree -Dincludes=<groupId>:<artifactId> 2>&1 | tail -20
+```
+- If the resolved version ≠ the pinned version → `rm -rf ~/.m2/repository/<groupPath>/<artifactId>/<staleVer>` then re-run `mvn ... -U`.
+- If versions match → the operation was genuinely renamed. Re-read the connector's Mode-B / `<nick>-op-renames.json` and apply the rename to the flow XML.
+
+**Trigger B — opaque `ClassCastException` / `NullPointerException` with no app file in the stack.**
+Symptom: `java.lang.ClassCastException: class java.lang.String cannot be cast to class java.lang.Integer` (or similar) and the stack trace lives entirely inside `org.mule.runtime.*` / `com.mulesoft.*` classes — no file/line in `src/main/mule/`.
+
+Before editing anything, re-run with debug and grep for the failure frame + bean context:
+```bash
+mvn clean package -DskipTests -X 2>&1 | grep -B 20 -A 3 'ClassCastException\|NullPointerException' \
+  | tee tmp/mvn-failures/build-<attempt>-debug.log
+```
+Then scan the preceding 20 lines for `Creating bean` / `parsing element` / `BeanDefinition` — those name the flow-XML element being constructed (e.g. `db:pooling-profile`, `http:listener-connection`). That element is where the fix lives. Common cause: a `${property}` placeholder on an attribute the new connector version now types as `xs:int`/`xs:boolean` — quote-strip or wrap in `${int(...)}` per the Mode-B `.attributes[].type`.
+
+**Both probes are cheap (single mvn invocation, no code changes) and MUST run before the third retry** — otherwise the loop hits its 3-retry cap while still guessing.
+
+**Trigger C — XSD error on an element/attribute that the plan already anticipated.**
+Symptom, either:
+- `cvc-complex-type.2.4.a: Invalid content ... element '<ns>:<name>'` AND grep shows `Rewrite <ns>:<name> →` in `tmp/upgrade-plan.md`; OR
+- `cvc-complex-type.4: Attribute '<attr>' must appear on element '<ns>:<name>'` AND grep shows `Add <ns>:<name> @<attr>=` in `tmp/upgrade-plan.md`.
+
+Do NOT re-analyze from XSD error text and do NOT guess an enum value. `grep -A2 "Rewrite <ns>:<name>\|Add <ns>:<name>" tmp/upgrade-plan.md` for the target directive, then apply that edit verbatim. The plan was written with Mode-B/C metadata already in hand (Step 12 sub-step 2) — trust it. If the plan bullet is missing but the WARN was present in Step 11.5 (or the attribute was declared `required: true` in the Mode-B/C JSON), that's a Step 12 skip; loop back to Step 12 and re-synthesize the plan (do not paper over it with a guess in Step 16).
+
+### Retry cap and halt
+
+- Retry budget: **3 build failures max** (log-and-diagnostic pass counts as ½ retry — see the classifier in 16.1).
+- If BUILD FAILURE persists after 3 real edit-retries with both escalation probes run, HALT via `AskUserQuestion` with:
+  1. First 30 lines of the last three `tmp/mvn-failures/build-<N>.log`
+  2. Dependency-tree excerpt (Trigger A) or debug stack frame (Trigger B), whichever ran
+  3. Classifications applied per retry
+  4. 2–4 candidate next actions (typically: pin a different connector version, revert one flow-XML edit, request a Mode-C describe of the failing config)
 
 ---
 
 ## Step 17: MUnit Loop
 
-(To be implemented)
+Runs ONLY after Step 16 reports `BUILD SUCCESS`. `mvn clean package` validates packaging only — `mvn test` is the authoritative runtime gate.
+
+```bash
+grep -c 'munit-maven-plugin' pom.xml
+```
+
+- `0` → no MUnit wired. Log `no runtime validation performed — fixture does not declare munit-maven-plugin` and skip the loop.
+- `>= 1` → MUnit is present. Enter the loop.
+
+**One `mvn test` per response.** On failure, apply the same recovery approach as Step 16's classifier (16.1), but the applicable classes are narrower — MUnit failures are always inside test XML, not flow XML. Save each failing run's output to `tmp/mvn-failures/munit-<attempt>.log`. The five MUnit-specific classes:
+
+1. **attribute-rename** on `<munit-tools:mock-when processor="<prefix:op>">` — an unknown mock attribute. Fix source: `tmp/connector-metadata/<nick>-new-<op>.json` `.attributes[].attributeName`.
+2. **element-rename** on `<munit-tools:mock-when processor="<prefix:oldOp>">` — the `processor` attribute names an op that no longer exists. Fix source: `<nick>-new.json` `.operations[]`; apply the plan's rename mapping.
+3. **connection-provider element name** — same shape as element-rename, but inside a `<munit-tools:mock-when processor="<prefix:config>">` referring to a connection-provider element. Fix source: `…-new-<config>-<provider>.json` `.elementName`.
+4. **enum-value** on a mocked payload — `<munit-tools:then-return>` returns a constant that's no longer a valid enum value. Fix source: per-op `.attributes[].allowedValues`.
+5. **assertion-shape** — `<munit-tools:assert-that>` reads a field the NEW op no longer emits. Fix source: cross-reference Mode-B `.output*` keys, rewrite the JSONPath / DW read.
+
+MUnit failures classify against the same Mode-B `.attributes[] / .childElements[] / .output*` JSON as flow-XML failures.
+
+**Retry budget: 5–6 attempts.** MUnit failures are more diffuse than XSD/DSL failures (test authoring style varies, and one op change often touches multiple mocks), so the budget is looser than Step 16's 3-retry cap. After the 6th failed `mvn test`, HALT via `AskUserQuestion` with the last three `tmp/mvn-failures/munit-<attempt>.log` excerpts (first 30 lines each), classifications, edits applied, and 2–4 candidate next actions.
+
+Do NOT attempt a 7th retry without user direction. Treat repeated failures as a signal that the plan missed a Mode-B / Mode-C detail, not as noise to retry through.
 
 - Run `mvn test`
 - Fix MUnit tests
@@ -505,19 +1108,35 @@ Use metadata from `describe-connector` to ensure operations, configs, and attrib
 
 ## Step 20: Clean Up Workspace `tmp/`
 
-(To be implemented)
+Delete `tmp/` **only** after Step 16 reported `BUILD SUCCESS` and Step 17 recorded its MUnit verdict — the state files are useful for diagnosing failures, so do not clean them up mid-flight. Per the "Build → cleanup → completion separation" rule at the top of this file, `rm -r tmp/` runs in **its own response**, as the only tool call: do NOT bundle it with a `mvn` invocation or with the Step 21 completion signal.
 
 Remove temporary files created during upgrade:
 
 ```bash
 rm -r tmp/
+# Remove the ephemeral fast-xml-parser install from Step 7 (if it was created).
+# It lands in the nearest package root, skills/mule-development/node_modules,
+# which is gitignored — but the stateless-skill contract is install → use → remove.
+rm -rf "<skill-dir>/../node_modules"
 ```
 
 ---
 
 ## Step 21: Declare Completion
 
-(To be implemented)
+**Its own response.** No `mvn`, no `rm`, no other tool calls. This response's only job is the three-line summary. Preconditions:
+
+1. Step 16 last returned `BUILD SUCCESS` on the upgraded project.
+2. Step 17 either recorded `mvn test` passed OR wrote `no runtime validation performed — fixture does not declare munit-maven-plugin`.
+3. Step 20 (`rm -r tmp/`) already ran in a previous response.
+
+Emit exactly three lines:
+
+1. `BUILD SUCCESS` with the path to `target/<project>-*.jar`.
+2. MUnit verdict from Step 17 (`mvn test: all passing` OR `no runtime validation performed — fixture does not declare munit-maven-plugin`).
+3. One-line from-to summary: `Mule <from> → <to>, Java <from> → <to>, connectors: <N> updated` — read the from/to values from `tmp/upgrade-targets.json` (`.mule.from`/`.mule.to`, `.java.from`/`.java.to`) before Step 20 removed it, or from your locked target in Step 4c.
+
+Do NOT include per-file diffs, "what was done" recaps, or speculative "next steps" — the user can read the diff.
 
 Present final summary:
 - Target versions achieved (Java, Mule Runtime)
@@ -572,4 +1191,35 @@ node <skill-dir>/scripts/resolve_target_versions.mjs .
 
 # Step 4 — validate a user-requested target (only when the user named one)
 TARGET_MULE=4.11 node <skill-dir>/scripts/resolve_target_versions.mjs .
+
+# Step 5a — extract connector dependencies from the POM chain (writes tmp/connectors.json)
+node <skill-dir>/scripts/extract_connectors.mjs .
+
+# Step 5b — check each current version's Java support on Exchange (writes tmp/connector-java-compat.json; exit 1 => STOP)
+node <skill-dir>/scripts/check_connector_java_compat.mjs .
+
+# Step 6 — resolve latest target-compatible version per connector (writes tmp/target-connectors.json; exit 1 => STOP)
+node <skill-dir>/scripts/resolve_target_connectors.mjs .
+
+# Step 6.5 — bridge: write tmp/connector-choices/<nick>-new.json + tmp/upgrade-targets.json (Write/jq), then sanity-check
+jq -e '.mule.to and .java.to and (.connectors|type=="array")' tmp/upgrade-targets.json
+
+# Step 7a — Mode-A summary describe of a NEW connector version (Java 17+ required)
+<skill-dir>/scripts/describe_connector.mjs <nick>-new
+
+# Step 7b — enumerate connector usage from flow XML (parser-preferred, grep fallback rc=3)
+<skill-dir>/scripts/enumerate_usage_xml.mjs <nick> .
+<skill-dir>/scripts/enumerate_usage.mjs <nick> .
+
+# Step 7b — Mode-B (per op/source) and Mode-C (per config-provider) describe
+<skill-dir>/scripts/describe_connector.mjs <nick>-new --type operation --name <op>
+<skill-dir>/scripts/describe_connector.mjs <nick>-new --type connection-provider --name <provider> --config-name <config>
+
+# Step 11.5 — coverage gate (exit 1 => re-run missing describes)
+<skill-dir>/scripts/verify_metadata_coverage.mjs
+
+# Step 14 — deterministic version rewrites
+<skill-dir>/scripts/promote_new_connector_pins.mjs
+<skill-dir>/scripts/apply_runtime_bump.mjs .
+<skill-dir>/scripts/apply_connector_pin.mjs <nick> .
 ```
