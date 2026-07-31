@@ -221,6 +221,32 @@ The resulting `target/*.jar` is used by Step 7's Mode-A describe if introspectio
 
 ---
 
+## Step 3.5: Flow-XML Hygiene Scan (Phase-1 gate — every flow file)
+
+**Why this step exists.** `mule-maven-plugin` 3.x `process-classes` is a no-op — it never parses flow XML at build time. 4.9+ `process-classes` builds a Mule Runtime AST and namespace-aware SAX-parses **every** flow file, so it rejects any prefixed element/attribute (`doc:name`, `<ee:transform>`, `db:config`, …) whose prefix is **not** declared on an in-scope ancestor with `The prefix "<p>" ... is not bound`. This defect ships fine on 4.3 and is latent until the upgrade — the upgrade is simply the first toolchain that reads the XML. Because the baseline build (Step 3c) runs on the app's **current** (pre-4.9) runtime, it does **not** catch this. It must be found here, at plan time, on **every** flow file — not just the ones later steps happen to edit. (Step 15.1's per-file gate only fires on edited files; a latent prefix in an untouched file would otherwise reach Step 16's `mvn` and fail. This step is what closes that hole.)
+
+Scan every flow file. `xmllint --noout` reports an unbound prefix as a *warning* and still **exits 0**, so an exit-code check is not a gate — grep its stderr instead. This parses real XML, so it does **not** false-positive on DataWeave tokens (`accountId:`), error-type values (`VALIDATION:INVALID_VALUE`), or other `word:` text the way a raw prefix regex does:
+
+```bash
+hygiene_fail=0
+for file in $(find src/main/mule -name '*.xml'); do
+  errs="$(xmllint --noout "$file" 2>&1)"
+  if printf '%s' "$errs" | grep -qE 'namespace error|not defined|not bound'; then
+    echo "⚠️  $file — unbound namespace prefix (latent; fails on Mule 4.9+):"
+    printf '%s\n' "$errs" | grep -E 'namespace error|not defined|not bound'
+    hygiene_fail=1
+  fi
+done
+[ "$hygiene_fail" = 1 ] && echo "→ record every file above in the plan's §Flow-XML hygiene section"
+```
+
+- **Clean (nothing printed)** → no latent unbound prefixes; continue to Step 4.
+- **One or more files flagged** → do **not** stop, and do **not** edit anything here (Phase 1 writes nothing to project files). Record **each** affected file and its offending prefix so Step 12's plan enumerates the fix. The error text names the prefix; the fix is to add that prefix's `xmlns:<prefix>="<namespace-uri>"` binding to the root `<mule>` of **that** file (look the URI up from a working flow file or the connector's Mode-A `.namespace`). The frequently-seen instance is `doc:name` without `xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"`. **Never** delete the prefixed attribute/element to silence the error — it is metadata/functionality, not noise.
+
+Every file flagged here MUST appear in the plan (Step 12) under a **§Flow-XML hygiene** section as an explicit per-file edit (`add xmlns:<prefix>="<uri>" to root <mule>`), **including files no other plan section touches** — that is the whole point of scanning up front. Step 15 then applies those additions, and Step 15.1's per-file gate re-verifies them.
+
+---
+
 ## Step 4: Determine Target Versions
 
 Determine the upgrade target from the confirmed current versions and the **live** runtime list. Never hardcode versions or channels — the script derives everything from `anypoint-cli-v4 dx mule runtime list`.
@@ -722,6 +748,7 @@ Every connector must have all four artifacts on disk, fully cross-checked agains
 - [ ] `tmp/connector-metadata/<nick>-new.json` — Mode-A summary
 - [ ] `tmp/connector-metadata/<nick>-new-<op>.json` — Mode-B per-op **for every op in `usage.operations_used[]` that intersects `new.operations[]`**
 - [ ] `tmp/connector-metadata/<nick>-new-<config>-<provider>.json` — Mode-C **for every (config, provider) pair the flow uses**
+- [ ] Every file flagged by the Step 3.5 hygiene scan is enumerated in the plan's §Flow-XML hygiene section (or the scan was clean and the section says so)
 
 Step 11.5's `verify_metadata_coverage.mjs` gate already ran the mechanical version of this presence check; if it exited 0 the artifacts are all present. If any artifact is missing, loop back to Step 5/6/7 and do **not** present a partial plan. Step 7's mandatory diffs (attribute-rename, error-type, provider-element set-membership, recursive child-tree) must already be complete — this checklist confirms their residues all landed as plan bullets below. **If any diff surfaces a symbol the plan does not enumerate, that plan is incomplete — go back to Step 7, re-describe, and re-synthesize.** "Build breaks after the skill claims success" is almost always metadata-present-but-ignored.
 
@@ -786,8 +813,9 @@ For each (config, provider) pair the flow uses:
 - Sites (from usage.usage_sites[])
 
 ## Connector-wide error type renames
-Enumerated from <nick>-new.json .errorTypes[]:
+Enumerated from <nick>-new.json .errorTypes[] (OLD types from usage.errorTypes_caught[] / errorTypes_raised[]):
 - <OLD_TYPE> → <NEW_TYPE>
+  - **Catch sites (where the edit actually happens):** grep the flow XML for the OLD type — `grep -rn 'type="<OLD_TYPE>"' src/main/mule/*.xml` — and list **every** `<on-error-propagate type="…">` / `<on-error-continue type="…">` `<file>:<line>` that names it. These handler sites are what Step 15 edits, NOT the operation that *raises* the error. Citing only the raise-site (the `<prefix:op>` element) leaves the `on-error-*` handler untouched and the build fails at `process-classes` with `Could not find error '<OLD_TYPE>'`. Enumerate one bullet per catch site.
 
 ## DataWeave downstream impact
 For every DW consumer that reads output from an op the plan will rewrite:
@@ -807,6 +835,11 @@ For every DW consumer that reads output from an op the plan will rewrite:
 
 ## xsi:schemaLocation URLs
 - apply_connector_pin.mjs will rewrite mule-<connector>.xsd URLs deterministically
+
+## Flow-XML hygiene (from Step 3.5 scan)
+For every file the Step 3.5 hygiene scan flagged (latent unbound prefix — fails on 4.9+), one bullet, **including files no other section touches**:
+- <file>: add `xmlns:<prefix>="<namespace-uri>"` to root <mule>   (offending prefix: <prefix>; source: Step 3.5 xmllint stderr)
+- (write "none — all flow files namespace-well-formed" if the scan was clean)
 
 ## Known risks / operator-attention items
 - Java-window warnings, DW sites flagged for operator, true-removal ops with no rename target, etc.
@@ -932,7 +965,7 @@ Apply the edits enumerated in `tmp/upgrade-plan.md` **mechanically** — no new 
 3. `Edit` the element in place per the plan's contract: element rename (prefix + local-name); attribute renames from `.attributes[].attributeName`; attribute → child-element promotions from `.childElements[]`; drop removed attributes; insert new-required attributes/children with the plan's default; rewrite `<on-error-propagate type="…">` / `<on-error-continue type="…">` per the plan's error-type map.
 4. **Preserve** `doc:name`, DataWeave payloads, `config-ref` values, and other unrelated children.
 5. If the namespace prefix changed, update the `xmlns:<oldprefix>` → `xmlns:<newprefix>` binding on the flow's root `<mule>` element. Do NOT touch `xsi:schemaLocation`.
-6. After all sites for the op are edited, run `xmllint --noout <file>` on each touched file to verify parseability.
+
 
 **Per-config** — for each (config, provider) pair in the plan:
 
@@ -940,6 +973,19 @@ Apply the edits enumerated in `tmp/upgrade-plan.md` **mechanically** — no new 
 2. Rewrite the connection element's local-name to the plan's provider `.elementName` from Mode-C.
 3. Apply the attribute renames on the connection element from the plan.
 4. If the namespace prefix changed, rewrite the config's element prefix — the local-names above are unchanged.
+
+**After all edits above, verify every touched file is namespace-well-formed (per-file gate).** Run this on each file edited in the per-operation and per-config passes above. **`xmllint --noout` alone is not a gate** — it reports an unbound namespace prefix (e.g. `doc:name` with no `xmlns:doc` on the root) as a *warning* and still **exits 0**, so an exit-code / `&& echo ✅` check passes on XML that the Mule 4.9+ build-time AST parser (`mule-maven-plugin` `process-classes`) will reject. Grep the stderr and fail on any namespace error:
+
+```bash
+errs="$(xmllint --noout "$file" 2>&1)"
+if printf '%s' "$errs" | grep -qE 'namespace error|not defined|not bound'; then
+  echo "❌ $file — unbound namespace prefix:"; printf '%s\n' "$errs"; exit 1
+fi
+```
+
+The defect is any prefixed element or attribute (`<ee:transform>`, `doc:name`, `db:config`, …) whose prefix is not declared on an in-scope ancestor — a latent problem that `mule-maven-plugin` 3.x never parsed at build time but 4.9+ does. The error text names the offending prefix; fix by adding that prefix's `xmlns:<prefix>="<namespace-uri>"` binding to the root `<mule>` element (look the URI up from a working flow file or the connector's Mode-A `.namespace`). A frequently-seen instance is `doc:name` without `xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"`. Never delete the prefixed attribute/element to silence the error.
+
+> **Scope limit (known gap):** this gate only runs on files Step 15 actually edits. A latent unbound prefix in a flow file the plan never touches will slip past it and fail the build at Step 16. The Step 3.5 XML-hygiene gate (Phase 1) is what closes that hole by scanning **every** flow file up front — this per-file gate is the second line of defense on edited files.
 
 ### 15.2 DataWeave edits (plan §DataWeave downstream impact)
 
@@ -973,7 +1019,7 @@ Use metadata from `describe-connector` to ensure operations, configs, and attrib
 
 ## Step 16: Build Loop
 
-Bounded recovery loop with a **3-retry** cap. `mvn clean package` BUILD SUCCESS is packaging-only — it validates that (a) XSDs parse, (b) DataWeave compiles, (c) the `.jar` packages. It does NOT execute any flow, hit any external system, or run MUnit. Step 17 (`mvn test`) is the real runtime gate.
+Bounded recovery loop with a **5-retry** cap. `mvn clean package` BUILD SUCCESS is packaging-only — it validates that (a) XSDs parse, (b) DataWeave compiles, (c) the `.jar` packages. It does NOT execute any flow, hit any external system, or run MUnit. Step 17 (`mvn test`) is the real runtime gate.
 
 - Run `mvn clean package -DskipTests 2>&1 | tee tmp/mvn-failures/build-<attempt>.log`
 - If BUILD SUCCESS → advance to Step 17.
