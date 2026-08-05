@@ -29,8 +29,8 @@ export function runProbe(cmd, args, opts = {}) {
     encoding: 'utf8',
     shell: false,
     // Exchange `asset describe --output json` for large connectors (http, db)
-    // exceeds Node's 1 MB default, yielding ENOBUFS/SIGTERM/status:null. The
-    // bash original piped straight to jq with no cap; mirror that here.
+    // exceeds Node's 1 MB default, yielding ENOBUFS/SIGTERM/status:null. Lift
+    // the cap so the full JSON is captured.
     maxBuffer: Infinity,
   });
   return {

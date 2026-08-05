@@ -46,7 +46,7 @@ anypoint-cli-v4 conf username <username>
 anypoint-cli-v4 conf password <password>
 ```
 
-**Requires:** Mule Runtime **4.4+** and Java **8+**. Apps below either are not supported, upgrade to the baseline first.
+**Requires:** Mule Runtime **4.3+** and Java **8+**. Apps below either are not supported, upgrade to the baseline first.
 
 **Required files in project:**
 - `mule-artifact.json` - Mule application metadata
@@ -62,9 +62,11 @@ This skill ships small Node.js (ESM, zero-dep) scripts under `scripts/`. Invoke 
 | Script | Purpose | Output location |
 | --- | --- | --- |
 | `scripts/validate_prerequisites.mjs` | Step 1 — validate app directory (`pom.xml` + `mule-artifact.json`), parent-POM availability (if referenced), Anypoint CLI v4, DX plugin. Validation-ONLY; exits non-zero when `errors[]` is non-empty | `tmp/upgrade-prereqs.json` (contains `inAppDir`, `parentDeclared`, `parentFound`, `cliPresent`, `dxPluginPresent`, `errors[]`, ...) |
-| `scripts/detect_current_mule_version.mjs` | Step 2a — determine the current Mule Runtime version from the `app.runtime` property, searching the child `pom.xml` then its full local parent chain (parent, grandparent, …) with `${...}` resolved against the merged chain, and flag versions below the supported floor (4.4) | `tmp/current-mule-version.json` (contains `version`, `source`, `resolvedFrom` (`"child"` \| `"parent"` \| `"ancestor"`), `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
-| `scripts/detect_current_java_version.mjs` | Step 2b — determine the current Java version from `mule-artifact.json` `javaSpecificationVersions`, and flag versions below the supported floor (8) | `tmp/current-java-version.json` (contains `version`, `source`, `supportedVersions`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
+| `scripts/detect_current_mule_version.mjs` | Step 2a — determine the current Mule Runtime version from the `app.runtime` property, searching the child `pom.xml` then its full local parent chain (parent, grandparent, …) with `${...}` resolved against the merged chain, and flag versions below the supported floor (4.3). `--user-version <v>` persists a user-supplied/corrected value (also flagged via `belowFloor`) | `tmp/current-mule-version.json` (contains `version`, `source`, `resolvedFrom` (`"child"` \| `"parent"` \| `"ancestor"`), `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
+| `scripts/detect_current_java_version.mjs` | Step 2b — determine the current Java version from `mule-artifact.json` `javaSpecificationVersions`, and flag versions below the supported floor (8). `--user-version <n>` persists a user-supplied/corrected value (also flagged via `belowFloor`) | `tmp/current-java-version.json` (contains `version`, `source`, `supportedVersions`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
 | `scripts/resolve_jdk.mjs` | Step 3 & Phase 2 — ensure a JDK for a given Java **major** is available and report a usable `JAVA_HOME`. Resolves major → full build string (e.g. `8` → `8.0.472_8`) via `dx mule runtime list` (matrix-file fallback), reuses an already-installed JDK under the Anypoint Code Builder java dir, and downloads only when none is present. MAY download (network) unless `--no-download` | `tmp/resolve-jdk-<major>.json` (contains `major`, `requestedBuild`, `javaHome`, `javaBin`, `source`, `downloaded`, `available`, `errors[]`, ...) |
+| `scripts/check_maven_compat.mjs` | Step 3c (pre-build) — verify the **local** `mvn` version is compatible with the app's **current** `mule-maven-plugin` (read from the child `pom.xml` then its local parent chain, `${...}` resolved). HARD-STOPS (exit 1) when a 3.x plugin would run on Maven ≥ 3.9 — the mismatch that crashes with `NoClassDefFoundError: …BasicRepositoryConnectorFactory` — with a fix-it message pointing at Maven 3.8.x. Validation-ONLY; no download, no mutation. Passes (exit 0) when compatible or when no explicit plugin version is resolvable locally | `tmp/maven-compat.json` (contains `mavenVersion`, `mavenMajor`, `mavenMinor`, `pluginVersion`, `pluginMajor`, `pluginDefinedIn`, `compatible`, `errors[]`, `warnings[]`, ...) |
+| `scripts/resolve_runtime.mjs` | Step 13 — ensure the **target** Mule Runtime distribution is present and report its `runtimePath`. Reuses an installed `mule-enterprise-standalone-<version>` under the Anypoint Code Builder runtime dir, else downloads it via `dx mule runtime download` — only if `dx mule runtime list` offers that version. MAY download (network) unless `--no-download`. Never sets a runtime path | `tmp/resolve-runtime-<version>.json` (contains `version`, `resolvedVersion`, `runtimePath`, `source`, `downloaded`, `available`, `errors[]`, ...) |
 | `scripts/resolve_target_versions.mjs` | Step 4 — determine the recommended upgrade target (in-channel: highest minor, latest patch, latest non-EOL Java) from the current versions + live `dx mule runtime list`, and validate a user-requested target (`TARGET_MULE`/`TARGET_JAVA`) against the locked policy. Advisory — always exits 0; caller branches on fields | `tmp/target-versions.json` (contains `currentMule`, `currentJava`, `channel`, `options[]`, `requestedTarget` {`accepted`, `mule`, `java`, `reasonCode`, `reason`, `crossChannel`, `warning`, `belowRecommended`, `note`}, `requestedJavaOnly` {`java`, `supported`, `supportedJavas[]`, `recommendedMule`, `recommendedJava`, `note`}, `nothingToUpgrade`, `needsUserPrompt`, `warnings[]`, ...) |
 | `scripts/extract_connectors.mjs` | Step 5a — extract the connector dependencies (`<classifier>mule-plugin</classifier>`, non-test-scoped) from the app's `pom.xml` and its full local ancestor chain (parent, grandparent, …), resolving each version from the local POMs: inline, `${...}` (single, nested, or composite like `${major}.${minor}`), inherited `<dependencies>`, and version-less deps managed in any local `<dependencyManagement>` (this POM's own or an ancestor's). Deterministic static parse; no CLI, no network. Advisory — always exits 0 | `tmp/connectors.json` (contains `connectors[]` {`nick`, `groupId`, `artifactId`, `version`, `versionResolved`, `resolvedFrom`, `versionManagedIn?`}, `excluded[]` (test-scoped), `needsUserPrompt`, `warnings[]`, ...) |
 | `scripts/check_connector_java_compat.mjs` | Step 5b — for each connector from Step 5a, `exchange asset describe <groupId>/<assetId>/<version>` (exact lookup, with retries) and read its `is-java-*-supported` tags to report which Java versions the CURRENT in-use version supports. HARD-STOPS (exit 1, `stop: true`) when a connector cannot be verified: describe fails (not resolvable in Exchange), or no `is-java-*` tags are present | `tmp/connector-java-compat.json` (contains `connectors[]` {`nick`, `groupId`, `artifactId`, `version`, `supportedJava[]`, `blocked`, `blockReason`}, `blocked[]`, `stop`, `warnings[]`, ...) |
@@ -74,11 +76,11 @@ This skill ships small Node.js (ESM, zero-dep) scripts under `scripts/`. Invoke 
 | `enumerate_usage_xml.mjs` | **Preferred** usage enumerator — parses `src/main/mule/**/*.xml` with `fast-xml-parser`. Identical output to `enumerate_usage.mjs` but correct on messy input (ignores commented-out elements; binds `config-ref` to its owning element). Exits rc=3 if `fast-xml-parser` isn't importable → caller falls back to the grep script. See Step 7 "Usage enumeration". | `tmp/connector-usage/<nick>.json` |
 | `enumerate_usage.mjs` | Zero-dependency (regex/grep) usage enumerator — the fallback for `enumerate_usage_xml.mjs`. Scans `src/main/mule/**/*.xml` for a connector's ops, configs, error types, namespace prefix used by the app. The OLD-side source of truth — replaces re-describing the old connector version. See Step 7b (usage enumeration + output shape). | `tmp/connector-usage/<nick>.json` |
 | `apply_connector_pin.mjs` | Bumps one connector's version in `pom.xml` and rewrites its `xsi:schemaLocation` in every flow XML. Reads `tmp/connector-choices/<nick>-new.json` (GAV, required) and `tmp/connector-metadata/<nick>-new.json` (namespace metadata, **optional** — absent for pom-only connectors, in which case the XSD rewrite no-ops). Deterministic — never hand-edit `xsi:schemaLocation`. | mutates `pom.xml` + `src/main/mule/**/*.xml` |
-| `apply_runtime_bump.mjs` | Bumps `<app.runtime>`, `<javaVersion>`, `<maven.compiler.source/target>`, `<mule.maven.plugin.version>` in `pom.xml`, and `minMuleVersion` + `javaSpecificationVersions` in `mule-artifact.json`. Reads targets from `tmp/upgrade-targets.json` (`.mule.to` / `.java.to`). Matrix in `references/runtime-bump-matrix.md`. Exits 2 if running Java doesn't match the target. | mutates `pom.xml` + `mule-artifact.json` (+ `.mvn/jvm.config` on Java 17) |
+| `apply_runtime_bump.mjs` | Ensures `<app.runtime>` (bumped, or inserted if absent); bumps `<javaVersion>`, `maven.compiler.{source,target,release}`, `java.version`, `jdk.version` **only if present**; bumps/inserts `<mule.maven.plugin.version>` in `pom.xml`; sets `minMuleVersion` and ensures `javaSpecificationVersions` contains the target Java in `mule-artifact.json`. All values read from `tmp/upgrade-targets.json` (`.mule.to` / `.java.to`) — nothing hardcoded. Matrix in `references/runtime-bump-matrix.md`. Exits 2 if running Java doesn't match the target. | mutates `pom.xml` + `mule-artifact.json` |
 | `promote_new_connector_pins.mjs` | Copies every `tmp/connector-choices/<nick>-new.json` → `tmp/connector-versions/<nick>.json` so Phase 2's pin script can consume them. Run once, before `apply_connector_pin.mjs`. | `tmp/connector-versions/<nick>.json` |
 | `verify_metadata_coverage.mjs` | Step 11.5 gate — for every op / source / provider in `tmp/connector-usage/*.json`, verify a Mode-B / Mode-C JSON exists in `tmp/connector-metadata/`. Exits 1 with FAIL rows when any required per-op / per-provider describe is missing. Configs whose Mode-A `.connectionProviders[]` is empty (D7 fallback — some DB configs) emit INFO and do not fail; Phase C reads Mode-A `.configs[]` directly for those. Optional `--strict` also fails on WARN rows (renamed / removed ops that lack a `<nick>-op-renames.json` entry). | stdout FAIL/WARN/INFO rows |
 
-Shared helpers live in `lib/*.mjs` alongside `scripts/`: `anypoint.mjs` (CLI env scrubbing), `fsx.mjs` (I/O), `platform.mjs` (Java version parsing), `pom-edit.mjs` (pom.xml + mule-artifact.json + XSD rewrites), `xml-flow.mjs` (flow XML grep primitives). Steps 1–6's detection/validation/extraction scripts share `scripts/_pom_utils.mjs` (tolerant XML + `${...}` + parent-POM location + managed-version lookup); Steps 7–21's edit scripts use `lib/pom-edit.mjs` — the two POM helpers are independent and both survive. The pre-2.0.0 bash + Python originals live under `scripts/archive/` for parity reference and rollback; the skill runtime does not invoke them.
+Shared helpers live in `lib/*.mjs` alongside `scripts/`: `anypoint.mjs` (CLI env scrubbing), `fsx.mjs` (I/O), `platform.mjs` (Java version parsing), `pom-edit.mjs` (pom.xml + mule-artifact.json + XSD rewrites), `xml-flow.mjs` (flow XML grep primitives). Steps 1–6's detection/validation/extraction scripts share `scripts/_pom_utils.mjs` (tolerant XML + `${...}` + parent-POM location + managed-version lookup); Steps 7–21's edit scripts use `lib/pom-edit.mjs` — the two POM helpers are independent.
 
 Invoke scripts by the absolute path you were given in the "skill is now active" message (it is the directory containing this `SKILL.md`). Do **not** construct relative paths like `../scripts/...` — Cline's working directory shifts across turns and relative paths have produced "No such file or directory" errors in real runs. The inline step examples below write `scripts/...` as shorthand; substitute `<skill-dir>/scripts/...` when you actually execute them.
 
@@ -91,7 +93,7 @@ Invoke scripts by the absolute path you were given in the "skill is now active" 
 This workflow has two phases separated by a hard user-approval gate.
 
 - **Phase 1: Plan (Steps 1–12).** Validate prerequisites, get current versions, build baseline, determine target versions, extract connectors and check their current Java compatibility, resolve target-compatible connector versions, analyze plugin/DataWeave/MUnit compatibility, present upgrade plan, wait for user approval. Phase 1 writes **nothing** to project files — all artifacts live under workspace-relative `tmp/` directory. No modifications to `mule-artifact.json`, `pom.xml`, or flows until approval.
-- **Phase 2: Execute (Steps 13–21).** Download runtime/Java, update versions, update application code (flows/configs/DW/custom Java), run build loop, run MUnit loop, cleanup workspace, declare completion. Phase 2 is the only phase that modifies project files.
+- **Phase 2: Execute (Steps 13–20).** Download runtime/Java, update versions, update application code (flows/configs/DW/custom Java), run build loop, run MUnit loop, cleanup workspace, declare completion. Phase 2 is the only phase that modifies project files.
 
 Phase 2 MUST NOT start until Step 12's approval gate has been passed explicitly. Skipping the plan or modifying files before approval defeats the purpose of the two-phase structure.
 
@@ -123,7 +125,7 @@ node scripts/validate_prerequisites.mjs .
 It writes the validation findings to `tmp/upgrade-prereqs.json` (read fields with `jq`, e.g. `jq -r '.parentFound' tmp/upgrade-prereqs.json`). **If the script exits non-zero (i.e. `errors[]` is non-empty), STOP and act on the errors before progressing.** The most common ones:
 
 - **Not in an app directory** (`pom.xml` / `mule-artifact.json` missing) → tell the user to run from the Mule application root.
-- **Parent POM declared but not found locally** (`parentDeclared: true`, `parentFound: false`) → the parent is required both for version detection (Step 2) and for Phase 2 edits (inherited connector/plugin versions, Steps 14/19). Ask the user to make the parent POM available at a local relative path (resolvable from the child's `<parent><relativePath>`, or the default `../pom.xml`) and re-run. **Do not attempt to download it.**
+- **Parent POM declared but not found locally** (`parentDeclared: true`, `parentFound: false`) → the parent is required both for version detection (Step 2) and for Phase 2 edits (inherited connector/plugin versions, Steps 14/18). Ask the user to make the parent POM available at a local relative path (resolvable from the child's `<parent><relativePath>`, or the default `../pom.xml`) and re-run. **Do not attempt to download it.**
 - **Toolchain missing** (`cliPresent` / `dxPluginPresent` false) → point the user at the install commands in Prerequisites.
 
 Only proceed to Step 2 once the script exits zero.
@@ -144,13 +146,21 @@ node scripts/detect_current_mule_version.mjs .
 
 It writes the result to `tmp/current-mule-version.json`. Read fields from the file with `jq` (e.g. `jq -r '.version' tmp/current-mule-version.json`) and branch on it:
 
-- **`belowFloor: true`** → the detected `version` is below the minimum supported Mule Runtime (`minSupportedVersion`, currently 4.4). This app is **out of scope** — there is no valid version to prompt for. **Stop** and tell the user to upgrade the app to at least that version before running this skill (see `warnings`).
+- **`belowFloor: true`** → the detected `version` is below the minimum supported Mule Runtime (`minSupportedVersion`, currently 4.3). This app is **out of scope** — there is no valid version to prompt for. **Stop** and tell the user to upgrade the app to at least that version before running this skill (see `warnings`).
 - **`version` set, `needsUserPrompt: false`** → use `version` as the current Mule Runtime version. Continue.
 - **`needsUserPrompt: true`** → the script could not settle on a trustworthy version. Inspect `warnings`:
   - parent declared but not found locally → ask the user to make the parent POM available locally, then re-run this step. **Do not attempt to download it.**
   - otherwise (nothing resolvable) → ask the user for the current Mule Runtime version. If they cannot provide it, **stop**.
 
-**Floor also applies to a user-supplied version.** Whenever you obtain the current Mule version from the user (any prompt above), apply the same floor yourself: if it is below `minSupportedVersion` (4.4), the app is out of scope — **stop** with the same guidance. The script only floor-checks the version *it* detected; a value the user typed is yours to validate.
+  Then **persist the answer** by re-running the script with `--user-version` so downstream steps read a real value (not `null`) from the file — the answer lives only in this conversation until you write it back:
+
+  ```bash
+  node scripts/detect_current_mule_version.mjs . --user-version <v>
+  ```
+
+  This rewrites `tmp/current-mule-version.json` with `version: <v>`, `source: "user-supplied"`, and sets `belowFloor: true` if `<v>` is below the floor (4.3) — treat that as the stop below.
+
+**Floor also applies to a user-supplied version.** The `--user-version` re-run applies the floor for you (`belowFloor: true`) — if it flags below-floor, the app is out of scope: **stop** and tell the user to move the app to at least Mule 4.3 first.
 
 Detection source (implemented by the script): the `app.runtime` property — checked in the child `pom.xml`, then the parent `pom.xml` — resolving `${...}` against the merged child+parent properties. This is the only source used for the MRT version. An unresolvable reference falls through to the prompt rather than being accepted literally.
 
@@ -167,10 +177,18 @@ It writes the result to `tmp/current-java-version.json`. Read fields from the fi
 - **`belowFloor: true`** → the detected `version` is below the minimum supported Java (`minSupportedVersion`, currently 8). This app is **out of scope** — **stop** and tell the user to upgrade the app to at least Java 8 before running this skill (see `warnings`).
 - **`version` set, `needsUserPrompt: false`** → use `version` as the current Java version. Continue.
 - **`needsUserPrompt: true`** → inspect `warnings` / `supportedVersions`:
-  - `supportedVersions` has multiple entries → `mule-artifact.json` declares support for several Java versions; ask the user which one the app currently runs on, then continue.
+  - `supportedVersions` has multiple entries → `mule-artifact.json` declares support for several Java versions; ask the user which one the app currently runs on.
   - otherwise (`javaSpecificationVersions` absent/empty, or no `mule-artifact.json`) → ask the user for the current Java version. If they cannot provide it, **stop**.
 
-**Floor also applies to a user-supplied version.** Whenever you obtain the current Java version from the user (any prompt above), apply the same floor yourself: if it is below `minSupportedVersion` (8), the app is out of scope — **stop** with the same guidance. The script only floor-checks the version *it* detected.
+  Then **persist the answer** by re-running the script with `--user-version` so downstream steps read a real value (not `null`) from the file — the answer lives only in this conversation until you write it back:
+
+  ```bash
+  node scripts/detect_current_java_version.mjs . --user-version <n>
+  ```
+
+  This rewrites `tmp/current-java-version.json` with `version: <n>`, `source: "user-supplied"`, and sets `belowFloor: true` if `<n>` is below the floor (8) — treat that as the stop below.
+
+**Floor also applies to a user-supplied version.** The `--user-version` re-run applies the floor for you (`belowFloor: true`) — if it flags below-floor, the app is out of scope: **stop** and tell the user to move the app to at least Java 8 first.
 
 Detection source (implemented by the script): `mule-artifact.json` `javaSpecificationVersions` — one entry → use it; multiple → prompt which one; absent/empty (or no `mule-artifact.json`) → prompt the user. This is the only source used for the Java version; `pom.xml` compiler settings are not used as a fallback (they are the compile target, not the deployed runtime Java). Values are normalized (`1.8` → `8`).
 
@@ -187,7 +205,9 @@ Read `tmp/current-mule-version.json` and `tmp/current-java-version.json` from St
 > Detected your app's current versions — Mule Runtime **{muleVersion}**, Java **{javaVersion}**. Please confirm to proceed.
 
 - Confirm **only** detected values. A value the user already supplied in Step 2 (via a prompt) is already confirmed — **do not re-ask it.** If both came from the user, skip 3a entirely.
-- If the user corrects a value, use the corrected value from here on and re-apply the floor check (Mule ≥ 4.4, Java ≥ 8) yourself — a corrected value is user-supplied.
+- If the user corrects a value, use the corrected value from here on, and persist it the same way as Step 2 so Step 4 reads the corrected value (each re-run re-applies the floor, flagging `belowFloor` if below it):
+  - corrected **Mule** → `node scripts/detect_current_mule_version.mjs . --user-version <v>`
+  - corrected **Java** → `node scripts/detect_current_java_version.mjs . --user-version <n>`
 
 The **confirmed current Java major** that comes out of this step — the `version` field from `tmp/current-java-version.json` (when 2b auto-detected), or the value the user supplied/corrected — is `<current-java-major>` below. Use that same value in both 3b and 3c; do not fall back to the raw detected value if it was corrected here.
 
@@ -208,7 +228,18 @@ This is the same helper Phase 2 uses for the target Java — run it once per Jav
 
 ### 3c. Build
 
-Run the baseline build with the resolved `JAVA_HOME` (one `mvn` invocation, nothing else in the response):
+**First, verify the local Maven is compatible with the app's current plugin.** The baseline builds on the app's **current** `mule-maven-plugin`, which for Mule 4.3/4.4 apps is on the 3.x line. The 3.x plugin was built against Maven 3.8's Eclipse Aether; Maven 3.9 replaced it with Maven Resolver, so a 3.x plugin crashes on Maven ≥ 3.9 with a cryptic `NoClassDefFoundError: org/eclipse/aether/connector/basic/BasicRepositoryConnectorFactory` at packaging time. Catch that here, before the build, with an actionable message — the same "fail immediately, not seven steps later" philosophy as the Java gate:
+
+```bash
+node scripts/check_maven_compat.mjs .
+```
+
+Read `tmp/maven-compat.json` and branch:
+
+- **exit 0 (`compatible: true`)** → local Maven is fine (or the plugin version couldn't be resolved locally, in which case it's a `warnings[]` pass, not a block). Proceed to the build.
+- **exit 1 (`errors[]` non-empty)** → STOP. Surface `errors[0]` verbatim — it names the current plugin version, the local Maven version, and the fix (build this baseline with Maven 3.8.x, e.g. put a 3.8.x `bin/` first on `PATH` for this session). Do not attempt the `mvn` build until Maven reports 3.8.x. This is a toolchain mismatch on the developer machine, **not** an app defect.
+
+Then run the baseline build with the resolved `JAVA_HOME` (one `mvn` invocation, nothing else in the response):
 
 ```bash
 JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
@@ -216,8 +247,6 @@ JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
 
 - **`BUILD SUCCESS`** → baseline established. Continue to Step 4.
 - **Build fails** → STOP. Inform the user the app must build cleanly on its current versions before an upgrade can proceed, and surface the failure. Do not attempt upgrade edits to fix a pre-existing baseline failure.
-
-The resulting `target/*.jar` is used by Step 7's Mode-A describe if introspection needs the packaged extension model.
 
 ---
 
@@ -383,10 +412,10 @@ Run the resolver. It reads the connectors from Step 5a and the target from Step 
 node scripts/resolve_target_connectors.mjs .
 ```
 
-The target defaults to `tmp/target-versions.json` `options[0]` (the recommended target). To resolve against a different target — e.g. a user-confirmed `requestedTarget` from Step 4 — pass it explicitly:
+The target defaults to `tmp/target-versions.json` `options[0]` (the recommended target). To resolve against a different target — e.g. a user-confirmed `requestedTarget` from Step 4 — pass that confirmed pair explicitly (use the values from `tmp/target-versions.json`; never invent them):
 
 ```bash
-TARGET_MULE=4.9.0 TARGET_JAVA=17 node scripts/resolve_target_connectors.mjs .
+TARGET_MULE=<confirmed-mule> TARGET_JAVA=<confirmed-java> node scripts/resolve_target_connectors.mjs .
 ```
 
 **How it selects (one Exchange call per connector).** A single `exchange asset describe <groupId>/<assetId>/<currentVersion>` returns a `.versions[]` array listing *every* sibling version, each already carrying its own `min-mule-version` and `is-java-<major>-supported` tags. So the whole version history is filtered locally from one describe — no paging of the fuzzy `asset list`, no per-version calls. Among all versions it keeps those where **both** hold:
@@ -405,7 +434,7 @@ It writes `tmp/target-connectors.json` and **exits 1 when `stop: true`**. Read i
 
 ## Step 6.5: Stage the downstream data-contracts (bridge)
 
-Steps 7–21 and the Phase-2 mutation scripts do **not** re-read Steps 1–6's individual `tmp/*.json` files. They read two consolidated contracts that this step writes from the outputs you already have. It is the seam between the version-resolution half (Steps 1–6) and the introspection/execute half (Steps 7–21). Assemble both with a `Write` (or a `jq` construction), **not a new script** — no CLI, no network here.
+Steps 7–21 and the Phase-2 mutation scripts do **not** re-read Steps 1–6's individual `tmp/*.json` files. They read two consolidated contracts that this step writes from the outputs you already have. It is the seam between the version-resolution half (Steps 1–6) and the impact-analysis + execute half (Steps 7–21). Assemble both with a `Write` (or a `jq` construction), **not a new script** — no CLI, no network here.
 
 **Why a remap is needed.** Steps 5–6 key each connector by a nickname derived from its **artifact slug** (`mule-amazon-s3-connector` → `amazon-s3`, `mule-objectstore-connector` → `objectstore`). Steps 7/14 key on the **XSD prefix** the flow XML actually binds (`xmlns:s3=…` → `s3`, `xmlns:os=…` → `os`, `xmlns:sfdc=…` → `sfdc`). The Step-7 join between usage (`connector-usage/<prefix>.json`) and metadata/choices (`…/<nick>-new.json`) is an exact string match — so the choices/targets files this step writes **must** be keyed by the XSD prefix, not the slug. Read the bindings from `src/main/mule/**/*.xml` (`grep -ho 'xmlns:[a-zA-Z0-9_-]*=' src/main/mule/*.xml`), and for each connector in `tmp/target-connectors.json` map its `groupId:artifactId` to the prefix whose namespace URI matches that connector (agent judgment — the same mapping the old Step 4.5 used to assign nicks).
 
@@ -462,6 +491,17 @@ node <skill-dir>/scripts/resolve_jdk.mjs 17 .
 export JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-17.json)
 ```
 
+**Prerequisite: a Mule ≥ 4.9 runtime registered for describe.** `describe-connector` loads the connector's bundled poms through a locally installed Mule Runtime, **independent of the app's target runtime** (the app may still target 4.6 for deploy). Runtimes older than 4.9 fail with a silent `Java exited with code 1` because the CLI plugin calls `mule-runtime-ast.ErrorTypeBuilder.builder()`, a static method that only exists in Mule 4.9+. Ensure a ≥ 4.9 runtime is on disk, then register its path with the CLI (this is a one-time global CLI-config write; the resolve script itself never sets it). Reuse the finalized target when `mule.to` ≥ 4.9, otherwise use a 4.9+ substrate:
+
+```bash
+# Pick a >=4.9 substrate: reuse mule.to when it already qualifies, else 4.9.19.
+SUBSTRATE=$(jq -r 'if (.mule.to | split(".") | map(tonumber)) as $v | ($v[0] > 4 or ($v[0] == 4 and $v[1] >= 9)) then .mule.to else "4.9.19" end' tmp/upgrade-targets.json)
+node <skill-dir>/scripts/resolve_runtime.mjs "$SUBSTRATE" .
+anypoint-cli-v4 dx mule runtime path --set "$(jq -r .runtimePath tmp/resolve-runtime-$SUBSTRATE.json)"
+```
+
+If a describe still fails silently later, capture the hidden exception with `_JAVA_OPTIONS='-Xlog:exceptions*=info:file=/tmp/xlog.log' <skill-dir>/scripts/describe_connector.mjs <nick>-new` then `grep NoSuchMethodError /tmp/xlog.log` — a hit on `ErrorTypeBuilder.builder()` confirms the registered path is still < 4.9.
+
 ### 7a. Mode-A summary describe (the NEW version each connector was pinned to in Step 6)
 
 For each **used** connector nickname `<nick>` in `tmp/upgrade-targets.json` (skip pom-only — they have no flow usage to introspect):
@@ -505,8 +545,11 @@ npm install --no-save --prefix "$SKILL_PKG" fast-xml-parser >/dev/null 2>&1 || t
 
 for nick in $(jq -r '.connectors[].nick' tmp/upgrade-targets.json); do
   # Prefer the parser; rc=3 means fast-xml-parser wasn't importable → grep fallback.
+  # Capture the exit code into a named var immediately (portable across bash/zsh;
+  # a bare `[ $? -eq 3 ]` misfires if anything runs between the call and the test).
   <skill-dir>/scripts/enumerate_usage_xml.mjs "$nick" .
-  [ $? -eq 3 ] && <skill-dir>/scripts/enumerate_usage.mjs "$nick" .
+  rc=$?
+  [ "$rc" = 3 ] && <skill-dir>/scripts/enumerate_usage.mjs "$nick" .
 done
 ```
 
@@ -570,8 +613,8 @@ Execute the fan-out for every connector via this loop (paste verbatim — do not
 ```bash
 for usage in tmp/connector-usage/*.json; do
     nick="$(basename "$usage" .json)"
-    status="$(jq -r '.status // ""' "$usage")"
-    [ "$status" = "not_in_use" ] && continue
+    usage_status="$(jq -r '.status // ""' "$usage")"   # NOT `status` — read-only in zsh
+    [ "$usage_status" = "not_in_use" ] && continue
 
     modeA="tmp/connector-metadata/${nick}-new.json"
     [ -f "$modeA" ] || { echo "❌ Mode-A missing for $nick — re-run Step 7a"; exit 1; }
@@ -776,6 +819,9 @@ Write `tmp/upgrade-plan.md` with the rename bullets from 12.2 folded in. Plan **
 - Java: <from> → <to>
 - Connectors:
   - <nick>: <old-gav> → <new-gav>   [Java window verdict: ok | warn | block-handled]
+    - Current version Java support: [<supportedJava…>]   (source: connector-java-compat.json .connectors[].supportedJava)
+    - Target version Java support:  [<supportedJava…>]   (source: target-connectors.json .connectors[].supportedJava)
+    - Show this line for **every** connector so the user sees when a current version is off the target Java (e.g. current supports [8] only, target Java 17) and why the bump is needed. If the current version already supports the target Java, say so (no functional break, version-only bump).
 
 ## Namespace prefix changes
 - <nick>: <old-prefix> → <new-prefix>   (source: usage.namespace_prefix_changed)
@@ -825,13 +871,14 @@ For every DW consumer that reads output from an op the plan will rewrite:
   - Absent, sibling present (probable rename): proposed rewrite (with source citation)
   - Absent AND Mode-B has NO .output* keys: SITE FLAGGED FOR OPERATOR
 
-## pom.xml / mule-artifact.json
-- <app.runtime>: <from> → <to>
-- <javaVersion> / maven.compiler.{source,target}: <from> → <to>
+## pom.xml
+- <app.runtime>: <from> → <to> (inserted if absent)
+- <javaVersion> / maven.compiler.{source,target,release} / java.version / jdk.version: <from> → <to> (each bumped only if present)
 - <mule.maven.plugin.version>: bumped per references/runtime-bump-matrix.md
-- mule-artifact.json:
-  - minMuleVersion: <from> → <to>
-  - javaSpecificationVersions: add ["<to>"] if target is 17 or 21 and the field is absent
+
+## mule-artifact.json
+- minMuleVersion: <from> → <to>
+- javaSpecificationVersions: ensure it contains <to> (array inserted if absent, for any target Java)
 
 ## xsi:schemaLocation URLs
 - apply_connector_pin.mjs will rewrite mule-<connector>.xsd URLs deterministically
@@ -876,43 +923,24 @@ On `No, cancel`: stop the workflow. Leave `tmp/` in place for inspection.
 
 # Phase 2: Execute
 
-## Step 13: Download Runtime and Java
+## Step 13: Download Target Runtime and Java
 
-This step is a thin gate that verifies Java 17 is installed locally and that a Mule Runtime ≥ 4.9.x is registered with the Anypoint CLI.
-
-```bash
-/usr/libexec/java_home -v 17
-```
-
-If the command exits non-zero, HALT and prompt the user with `AskUserQuestion`:
-
-> "Java 17 is not installed. Install Azul Zulu 17 (preferred over Microsoft OpenJDK 17 for SFDC Nexus TLS compatibility) via `brew install --cask zulu@17`, then `export JAVA_HOME=$(/usr/libexec/java_home -v 17)` and re-run this step."
-
-**Why an introspection runtime is needed (and why ≥ 4.9).** `anypoint-cli-v4 dx mule describe-connector` (the engine behind every Mode-A/B/C call in Step 7, and the lazy single-connector re-describe in Step 16 class 6) needs a locally installed Mule Runtime to load the connector's bundled poms. This is **independent of the app's target runtime** — the app may still target 4.6.x for deploy; the CLI just needs a **4.9+** distribution as its introspection substrate. Runtimes older than 4.9 fail with a silent `Java exited with code 1`, because the JAR bundled in the CLI plugin calls `mule-runtime-ast.ErrorTypeBuilder.builder()`, a static method that only exists in Mule 4.9+.
-
-Verify the Mule Runtime path used by describe-connector:
+Ensure the **finalized target** Mule Runtime and target JDK are present on disk before the build. Both are driven by the approved target in `tmp/upgrade-targets.json` (`.mule.to` = full Mule version, `.java.to` = Java major) — never a hardcoded pair. Each resolver checks the local install dir first and only downloads when the version is absent. **A version can be downloaded only if `anypoint-cli-v4 dx mule runtime list` returns it** — that list is the sole source of truth for what is downloadable, so the target must always be one it offers (Step 4 already resolves the target against this same list).
 
 ```bash
-cat ~/.mule-dx/config.json 2>/dev/null | jq -r '.runtimePath // empty'
+# Target JDK — reads the target Java MAJOR from tmp/upgrade-targets.json.
+node <skill-dir>/scripts/resolve_jdk.mjs "$(jq -r '.java.to' tmp/upgrade-targets.json)" .
+
+# Target Mule Runtime — reads the full target Mule version from tmp/upgrade-targets.json.
+node <skill-dir>/scripts/resolve_runtime.mjs "$(jq -r '.mule.to' tmp/upgrade-targets.json)" .
 ```
 
-If empty or points at a Mule < 4.9.x install, HALT and set a 4.9+ path (one-time; persists in `~/.mule-dx/config.json`):
+- `resolve_jdk.mjs <major>` reuses an installed JDK of that major under `~/AnypointCodeBuilder/java`, else downloads the build the runtime list names for that major (`dx mule jdk download`). Writes `tmp/resolve-jdk-<major>.json` (`javaHome`). Exit 1 on failure.
+- `resolve_runtime.mjs <version>` reuses an installed `mule-enterprise-standalone-<version>` under `~/AnypointCodeBuilder/runtime`, else downloads it (`dx mule runtime download`) — but only if the runtime list offers that version. Writes `tmp/resolve-runtime-<version>.json` (`runtimePath`). Exit 1 on failure.
 
-> "anypoint-cli-v4 dx mule runtime path --set ~/AnypointCodeBuilder/runtime/mule-enterprise-standalone-4.11.2"
+Neither script sets `JAVA_HOME` or any runtime path — they only ensure the distribution is present and report where. If either exits non-zero, surface its stdout to the user via `AskUserQuestion` and WAIT (a download needs working CLI auth/network). Step 14's `apply_runtime_bump.mjs` performs the build's JAVA_HOME check against `.java.to` separately.
 
-**If describe-connector fails silently later**, capture the real exception (the `Java exited with code 1` message hides it):
-
-```bash
-_JAVA_OPTIONS='-Dmule.jvm.version.extension.enforcement=LOOSE -Xlog:exceptions*=info:file=/tmp/xlog.log' \
-  anypoint-cli-v4 dx mule describe-connector --connector <groupId>:<artifactId>:<version> --output json
-grep -E "NoSuchMethodError|doesn't support|ClassNotFoundException" /tmp/xlog.log | head -5
-```
-
-A `NoSuchMethodError` on `ErrorTypeBuilder.builder()` confirms a < 4.9 runtime path — fix it with the `--set` command above.
-
-- Download target Java version (if Java upgrade)
-- Download target MRT (if MRT upgrade)
-- Update JAVA_HOME and runtime paths
+> **Scope:** this step provisions the app's **target** runtime/JDK only.
 
 ---
 
@@ -937,7 +965,12 @@ done
 
 **No re-describe here.** Plan Phase already introspected every pinned connector into `tmp/connector-metadata/<nick>-new.json` (Step 7), and that is the file every downstream reader consumes — `apply_connector_pin.mjs` (namespace), `verify_metadata_coverage.mjs` (the coverage gate), and Step 16 classes 1–5. A second describe of the pinned connector (writing the no-suffix `<nick>.json`) is only ever read by Step 16's **class 6** recovery (`xsi:schemaLocation` 404), which almost never fires — so re-describing all N connectors unconditionally here spends N Java-17 CLI calls to populate a file that a green build never opens. **It is therefore done lazily**: Step 16 class 6 re-describes the single failing connector on demand if and only if a schema-URL failure needs the pinned-namespace ground truth. See Step 16 · 16.1 · class 6.
 
-The fixed order above (promote drafts → runtime bump → per-connector pin) **is** the pre-build preparation — no separate validator pass is needed before Step 16's `mvn`. `apply_connector_pin.mjs` owns the `xsi:schemaLocation` rewrite deterministically (one call per connector nickname); never hand-edit those URLs. `apply_runtime_bump.mjs` reads `.mule.to` / `.java.to` from `tmp/upgrade-targets.json` and bumps `pom.xml` (`<app.runtime>`, `<javaVersion>`, `maven.compiler.{source,target}`, `<mule.maven.plugin.version>` per `references/runtime-bump-matrix.md`) plus `mule-artifact.json` (`minMuleVersion`, `javaSpecificationVersions`).
+The fixed order above (promote drafts → runtime bump → per-connector pin) **is** the pre-build preparation — no separate validator pass is needed before Step 16's `mvn`. `apply_connector_pin.mjs` owns the `xsi:schemaLocation` rewrite deterministically (one call per connector nickname); never hand-edit those URLs. `apply_runtime_bump.mjs` reads `.mule.to` / `.java.to` from `tmp/upgrade-targets.json` and bumps `pom.xml` plus `mule-artifact.json`:
+
+- **`<app.runtime>`** — always ensured: bumped if present, else **inserted** into `<properties>` (an app that never declared it still gets pinned to the target runtime).
+- **Java version properties** — `<javaVersion>`, `maven.compiler.{source,target}`, `maven.compiler.release`, `java.version`, `jdk.version` are each bumped **only if already present** (never inserted — a POM that doesn't declare a tag shouldn't sprout it).
+- **`<mule.maven.plugin.version>`** — bumped if present, else inserted, per `references/runtime-bump-matrix.md`.
+- **`mule-artifact.json`** — `minMuleVersion` set to the target, and `javaSpecificationVersions` always ensured to contain the target Java (the array is **inserted if absent**).
 
 - Update mule-artifact.json (minMuleVersion, javaSpecificationVersions)
 - Update pom.xml (runtime version, Java version, connector versions, plugin versions)
@@ -1019,7 +1052,7 @@ Use metadata from `describe-connector` to ensure operations, configs, and attrib
 
 ## Step 16: Build Loop
 
-Bounded recovery loop with a **5-retry** cap. `mvn clean package` BUILD SUCCESS is packaging-only — it validates that (a) XSDs parse, (b) DataWeave compiles, (c) the `.jar` packages. It does NOT execute any flow, hit any external system, or run MUnit. Step 17 (`mvn test`) is the real runtime gate.
+Bounded recovery loop with a **5-retry** cap. `mvn clean package -DskipTests` BUILD SUCCESS is packaging-only — it validates that (a) XSDs parse, (b) DataWeave compiles, (c) the `.jar` packages. It does NOT execute any flow, hit any external system, or run MUnit. Step 17 (`mvn test`) is the real runtime gate.
 
 - Run `mvn clean package -DskipTests 2>&1 | tee tmp/mvn-failures/build-<attempt>.log`
 - If BUILD SUCCESS → advance to Step 17.
@@ -1051,7 +1084,7 @@ Bounded recovery loop with a **5-retry** cap. `mvn clean package` BUILD SUCCESS 
    ```
    Then read `<nick>.json` → `.namespace.uri`. Recovery: re-run `apply_connector_pin.mjs <nick> .` (it reads `<nick>-new.json` for the namespace and rewrites the URL deterministically). Do NOT hand-edit `xsi:schemaLocation`.
 7. **pom / plugin / runtime** — anything from the reactor before the app loads (`mule-maven-plugin` not found, `${app.runtime}` unresolved, `javaSpecificationVersions` mismatch, missing artifact in the local repo). Fix source: `references/runtime-bump-matrix.md`; `pom.xml` + `mule-artifact.json`; `tmp/connector-versions/*.json`. Recovery: re-run `apply_runtime_bump.mjs .` (runtime/plugin property wrong) or `apply_connector_pin.mjs <nick> .` (dependency version wrong). Only hand-edit `pom.xml` when both scripts report `not-found`.
-8. **unknown / other** — doesn't fit the classes above. Fix source: cross-reference `tmp/connector-metadata/*.json` + `tmp/connector-versions/*.json` with Mule 4 XSD/DSL semantics. Recovery: revisit whichever earlier phase's output the failure implicates; log reasoning in `tmp/mvn-failures/<attempt>.log`. Fall through to `AskUserQuestion` only once the 3-retry budget is exhausted OR the same knowledge-based edit has already failed once.
+8. **unknown / other** — doesn't fit the classes above. Fix source: cross-reference `tmp/connector-metadata/*.json` + `tmp/connector-versions/*.json` with Mule 4 XSD/DSL semantics. Recovery: revisit whichever earlier phase's output the failure implicates; log reasoning in `tmp/mvn-failures/<attempt>.log`. Fall through to `AskUserQuestion` only once the 5-retry budget is exhausted OR the same knowledge-based edit has already failed once.
 
 Apply **one** targeted edit per retry (one `Edit`, or the ONE script re-run named in the recovery step) — do not batch. Re-run `mvn clean package` in a NEW response. On success → Step 17; on failure → increment the retry counter and re-parse.
 
@@ -1080,7 +1113,7 @@ mvn clean package -DskipTests -X 2>&1 | grep -B 20 -A 3 'ClassCastException\|Nul
 ```
 Then scan the preceding 20 lines for `Creating bean` / `parsing element` / `BeanDefinition` — those name the flow-XML element being constructed (e.g. `db:pooling-profile`, `http:listener-connection`). That element is where the fix lives. Common cause: a `${property}` placeholder on an attribute the new connector version now types as `xs:int`/`xs:boolean` — quote-strip or wrap in `${int(...)}` per the Mode-B `.attributes[].type`.
 
-**Both probes are cheap (single mvn invocation, no code changes) and MUST run before the third retry** — otherwise the loop hits its 3-retry cap while still guessing.
+**Both probes are cheap (single mvn invocation, no code changes) and MUST run before the third retry** — otherwise the loop hits its 5-retry cap while still guessing.
 
 **Trigger C — XSD error on an element/attribute that the plan already anticipated.**
 Symptom, either:
@@ -1091,8 +1124,8 @@ Do NOT re-analyze from XSD error text and do NOT guess an enum value. `grep -A2 
 
 ### Retry cap and halt
 
-- Retry budget: **3 build failures max** (log-and-diagnostic pass counts as ½ retry — see the classifier in 16.1).
-- If BUILD FAILURE persists after 3 real edit-retries with both escalation probes run, HALT via `AskUserQuestion` with:
+- Retry budget: **5 build failures max** (log-and-diagnostic pass counts as ½ retry — see the classifier in 16.1).
+- If BUILD FAILURE persists after 5 real edit-retries with both escalation probes run, HALT via `AskUserQuestion` with:
   1. First 30 lines of the last three `tmp/mvn-failures/build-<N>.log`
   2. Dependency-tree excerpt (Trigger A) or debug stack frame (Trigger B), whichever ran
   3. Classifications applied per retry
@@ -1102,7 +1135,7 @@ Do NOT re-analyze from XSD error text and do NOT guess an enum value. `grep -A2 
 
 ## Step 17: MUnit Loop
 
-Runs ONLY after Step 16 reports `BUILD SUCCESS`. `mvn clean package` validates packaging only — `mvn test` is the authoritative runtime gate.
+Runs ONLY after Step 16 reports `BUILD SUCCESS`. `mvn clean package` validates packaging only — MUnit is the authoritative runtime gate.
 
 ```bash
 grep -c 'munit-maven-plugin' pom.xml
@@ -1111,7 +1144,11 @@ grep -c 'munit-maven-plugin' pom.xml
 - `0` → no MUnit wired. Log `no runtime validation performed — fixture does not declare munit-maven-plugin` and skip the loop.
 - `>= 1` → MUnit is present. Enter the loop.
 
-**One `mvn test` per response.** On failure, apply the same recovery approach as Step 16's classifier (16.1), but the applicable classes are narrower — MUnit failures are always inside test XML, not flow XML. Save each failing run's output to `tmp/mvn-failures/munit-<attempt>.log`. The five MUnit-specific classes:
+**Prefer `mvn clean test` over bare `mvn test`.** `clean` reduces stale-cache reuse, but it does NOT guarantee the `Skipping execution of munit because it has already been run` line disappears — MUnit binds its `test` execution more than once in the reactor, so a genuine run and a later `Skipping…` line routinely co-exist in the same log. `Skipping…` on its own is NOT a failure.
+
+**The pass gate is the `MUnit Run Summary`, nothing else — not `BUILD SUCCESS`, not the absence of `Skipping…`.** Grep the WHOLE log (`grep -nE 'MUnit Run Summary|Tests run:' <log>`), never judge from the tail. MUnit passes ONLY when the log contains an actual `MUnit Run Summary` with `Tests run: N (N >= 1)`, `Failed: 0`, `Errors: 0`. Treat as a FAIL only when there is NO `MUnit Run Summary` at all, or it shows `Tests run: 0`, or `Failed`/`Errors` > 0 — even if the build says `BUILD SUCCESS`. A trailing `Skipping execution of munit` line with a real `MUnit Run Summary` earlier in the log IS a pass.
+
+**One `mvn clean test` per response.** On failure, apply the same recovery approach as Step 16's classifier (16.1), but the applicable classes are narrower — MUnit failures are always inside test XML, not flow XML. Save each failing run's output to `tmp/mvn-failures/munit-<attempt>.log`. The five MUnit-specific classes:
 
 1. **attribute-rename** on `<munit-tools:mock-when processor="<prefix:op>">` — an unknown mock attribute. Fix source: `tmp/connector-metadata/<nick>-new-<op>.json` `.attributes[].attributeName`.
 2. **element-rename** on `<munit-tools:mock-when processor="<prefix:oldOp>">` — the `processor` attribute names an op that no longer exists. Fix source: `<nick>-new.json` `.operations[]`; apply the plan's rename mapping.
@@ -1121,26 +1158,18 @@ grep -c 'munit-maven-plugin' pom.xml
 
 MUnit failures classify against the same Mode-B `.attributes[] / .childElements[] / .output*` JSON as flow-XML failures.
 
-**Retry budget: 5–6 attempts.** MUnit failures are more diffuse than XSD/DSL failures (test authoring style varies, and one op change often touches multiple mocks), so the budget is looser than Step 16's 3-retry cap. After the 6th failed `mvn test`, HALT via `AskUserQuestion` with the last three `tmp/mvn-failures/munit-<attempt>.log` excerpts (first 30 lines each), classifications, edits applied, and 2–4 candidate next actions.
+**Retry budget: 6 attempts.** MUnit failures are more diffuse than XSD/DSL failures (test authoring style varies, and one op change often touches multiple mocks), so the budget is looser than Step 16's 5-retry cap. After the 6th failed `mvn clean test`, HALT via `AskUserQuestion` with the last three `tmp/mvn-failures/munit-<attempt>.log` excerpts (first 30 lines each), classifications, edits applied, and 2–4 candidate next actions.
 
 Do NOT attempt a 7th retry without user direction. Treat repeated failures as a signal that the plan missed a Mode-B / Mode-C detail, not as noise to retry through.
 
-- Run `mvn test`
+- Run `mvn clean test`
+- Confirm the `MUnit Run Summary` shows `Tests run: N (>= 1)`, `Failed: 0`, `Errors: 0` — `BUILD SUCCESS` alone is not a pass
 - Fix MUnit tests
 - Repeat until all tests pass
 
 ---
 
-## Step 18: Check DW Unauthorized Fields
-
-(To be implemented)
-
-- Detect DataWeave unauthorized field access
-- Surface results to user
-
----
-
-## Step 19: Bump Parent POM Version
+## Step 18: Bump Parent POM Version
 
 (To be implemented)
 
@@ -1152,7 +1181,7 @@ Do NOT attempt a 7th retry without user direction. Treat repeated failures as a 
 
 ---
 
-## Step 20: Clean Up Workspace `tmp/`
+## Step 19: Clean Up Workspace `tmp/`
 
 Delete `tmp/` **only** after Step 16 reported `BUILD SUCCESS` and Step 17 recorded its MUnit verdict — the state files are useful for diagnosing failures, so do not clean them up mid-flight. Per the "Build → cleanup → completion separation" rule at the top of this file, `rm -r tmp/` runs in **its own response**, as the only tool call: do NOT bundle it with a `mvn` invocation or with the Step 21 completion signal.
 
@@ -1168,7 +1197,7 @@ rm -rf "<skill-dir>/../node_modules"
 
 ---
 
-## Step 21: Declare Completion
+## Step 20: Declare Completion
 
 **Its own response.** No `mvn`, no `rm`, no other tool calls. This response's only job is the three-line summary. Preconditions:
 
@@ -1221,13 +1250,21 @@ node <skill-dir>/scripts/validate_prerequisites.mjs .
 
 # Step 2a — detect current Mule Runtime version (writes tmp/current-mule-version.json)
 node <skill-dir>/scripts/detect_current_mule_version.mjs .
+# When Step 2a needs a prompt (or Step 3a correction): persist the user's answer (sets belowFloor if < 4.3)
+node <skill-dir>/scripts/detect_current_mule_version.mjs . --user-version <v>
 
 # Step 2b — detect current Java version (writes tmp/current-java-version.json)
 node <skill-dir>/scripts/detect_current_java_version.mjs .
+# When Step 2b needs a prompt (or Step 3a correction): persist the user's answer
+node <skill-dir>/scripts/detect_current_java_version.mjs . --user-version <n>
 
 # Step 3b — ensure the current Java JDK is available (writes tmp/resolve-jdk-<major>.json)
 # MAY download over the network; pass --no-download to only detect an installed JDK.
 node <skill-dir>/scripts/resolve_jdk.mjs <current-java-major> .
+
+# Step 3c — verify local Maven is compatible with the CURRENT plugin (writes tmp/maven-compat.json)
+# HARD-STOP (exit 1) if a 3.x mule-maven-plugin would run on Maven >= 3.9 (BasicRepositoryConnectorFactory crash).
+node <skill-dir>/scripts/check_maven_compat.mjs .
 
 # Step 3c — baseline build on the resolved JAVA_HOME (must be BUILD SUCCESS)
 JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
@@ -1235,20 +1272,32 @@ JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
 # Step 4 — recommend a target (writes tmp/target-versions.json)
 node <skill-dir>/scripts/resolve_target_versions.mjs .
 
-# Step 4 — validate a user-requested target (only when the user named one)
-TARGET_MULE=4.11 node <skill-dir>/scripts/resolve_target_versions.mjs .
+# Step 4 — validate a user-requested target (only when the user named one; never invent one)
+TARGET_MULE=<user-requested-mule> node <skill-dir>/scripts/resolve_target_versions.mjs .
 
-# Step 5a — extract connector dependencies from the POM chain (writes tmp/connectors.json)
+# Step 5a — extract connector deps from the POM + local parent chain
+# (writes tmp/connectors.json; advisory, always exits 0 — branch on connectors[]/needsUserPrompt)
 node <skill-dir>/scripts/extract_connectors.mjs .
 
-# Step 5b — check each current version's Java support on Exchange (writes tmp/connector-java-compat.json; exit 1 => STOP)
+# Step 5b — check the CURRENT version's Java support in Exchange
+# (writes tmp/connector-java-compat.json; non-zero exit => STOP)
 node <skill-dir>/scripts/check_connector_java_compat.mjs .
 
-# Step 6 — resolve latest target-compatible version per connector (writes tmp/target-connectors.json; exit 1 => STOP)
+# Step 6 — resolve the LATEST target-compatible version per connector
+# (reads the target from tmp/target-versions.json options[0]; writes tmp/target-connectors.json; non-zero exit => STOP)
 node <skill-dir>/scripts/resolve_target_connectors.mjs .
+
+# Step 6 — resolve against a user-confirmed target instead of options[0]
+# (use the confirmed pair from tmp/target-versions.json — never invent versions)
+TARGET_MULE=<confirmed-mule> TARGET_JAVA=<confirmed-java> node <skill-dir>/scripts/resolve_target_connectors.mjs .
 
 # Step 6.5 — bridge: write tmp/connector-choices/<nick>-new.json + tmp/upgrade-targets.json (Write/jq), then sanity-check
 jq -e '.mule.to and .java.to and (.connectors|type=="array")' tmp/upgrade-targets.json
+
+# Step 7 prereq — register a Mule >=4.9 runtime substrate for describe (reuse mule.to if >=4.9)
+SUBSTRATE=$(jq -r 'if (.mule.to | split(".") | map(tonumber)) as $v | ($v[0] > 4 or ($v[0] == 4 and $v[1] >= 9)) then .mule.to else "4.9.19" end' tmp/upgrade-targets.json)
+node <skill-dir>/scripts/resolve_runtime.mjs "$SUBSTRATE" .
+anypoint-cli-v4 dx mule runtime path --set "$(jq -r .runtimePath tmp/resolve-runtime-$SUBSTRATE.json)"
 
 # Step 7a — Mode-A summary describe of a NEW connector version (Java 17+ required)
 <skill-dir>/scripts/describe_connector.mjs <nick>-new
@@ -1263,6 +1312,11 @@ jq -e '.mule.to and .java.to and (.connectors|type=="array")' tmp/upgrade-target
 
 # Step 11.5 — coverage gate (exit 1 => re-run missing describes)
 <skill-dir>/scripts/verify_metadata_coverage.mjs
+
+# Step 13 — ensure the TARGET JDK + Mule Runtime are present (check local dir, else download)
+# both read the finalized target from tmp/upgrade-targets.json; non-zero exit => surface stdout & WAIT
+node <skill-dir>/scripts/resolve_jdk.mjs "$(jq -r '.java.to' tmp/upgrade-targets.json)" .
+node <skill-dir>/scripts/resolve_runtime.mjs "$(jq -r '.mule.to' tmp/upgrade-targets.json)" .
 
 # Step 14 — deterministic version rewrites
 <skill-dir>/scripts/promote_new_connector_pins.mjs

@@ -9,13 +9,13 @@
 // Step 4 helper — determine the single recommended upgrade target from the
 // current Mule Runtime + Java versions and the live runtime list.
 //
-// Rules (locked with the skill owner / PM):
+// Rules:
 //   * Channel is sticky. Never cross channels, even if the other channel offers
 //     a higher runtime.
 //     - LTS minors are hardcoded (STOPGAP) until the runtime-list API exposes a
 //       `channel` field: see LTS_MINORS below. Everything else post-cadence is
-//       Edge. 4.4 predates the Edge/LTS cadence and is treated as LTS-lineage
-//       (targets the latest LTS).
+//       Edge. 4.3/4.4 predate the Edge/LTS cadence and are treated as
+//       LTS-lineage (target the latest LTS).
 //   * ONE recommended target: the highest minor in the current channel, at its
 //     latest patch, on that runtime's latest non-EOL Java (17 today).
 //       - Below the highest minor  -> minor upgrade  (e.g. 4.6.x -> 4.9.19 + 17).
@@ -82,8 +82,8 @@ function log(msg) { process.stdout.write(msg + "\n"); }
 // `channel` field. Everything else post-cadence is Edge. Update this one list
 // when MuleSoft designates a new LTS minor.
 const LTS_MINORS = ["4.6", "4.9"];
-// 4.4 predates the Edge/LTS cadence; treat it as LTS-lineage per skill owner.
-const LEGACY_MINORS = ["4.4"];
+// 4.3/4.4 predate the Edge/LTS cadence; treat them as LTS-lineage.
+const LEGACY_MINORS = ["4.3", "4.4"];
 
 // EOL / discouraged Java versions we NEVER recommend as an upgrade target. The
 // Java target is always the runtime's latest compatible Java that is NOT in this
@@ -122,7 +122,7 @@ function javaSpecOf(jdk) {
   return m ? m[1] : null;
 }
 function channelOfMinor(minor) {
-  if (LEGACY_MINORS.includes(minor)) return "LTS";  // 4.4 -> LTS-lineage
+  if (LEGACY_MINORS.includes(minor)) return "LTS";  // 4.3/4.4 -> LTS-lineage
   if (LTS_MINORS.includes(minor)) return "LTS";
   return "Edge";
 }

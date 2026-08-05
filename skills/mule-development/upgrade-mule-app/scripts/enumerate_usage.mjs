@@ -17,9 +17,7 @@
 //   - Error types raised         → type="PREFIX:..." on <raise-error>
 //   - Line-numbered usage sites  → per-op file+line+attributes_set
 //
-// Behaviour is preserved 1:1 with the pre-2.0.0 bash script (regex-based
-// grep + kebab→camel + prefix fallback). D-1 (structural rewrite) lands
-// as a follow-up.
+// Regex-based grep + kebab→camel + prefix fallback.
 //
 // Usage:
 //   node scripts/enumerate_usage.mjs <nickname> [<project-dir>]
@@ -96,7 +94,7 @@ if (!newMeta) {
 
 // String concat (not path.join) — the caller's PROJECT_DIR (typically ".")
 // must survive into FLOW_DIR unchanged so the emitted usage-site file paths
-// match the pre-2.0.0 bash "$FLOW_DIR"/*.xml shell-glob shape (`./src/...`).
+// keep their leading `./` (`./src/...`), which downstream readers depend on.
 const FLOW_DIR = `${PROJECT_DIR.replace(/\/$/, '')}/src/main/mule`;
 if (!isDir(FLOW_DIR)) {
   stderr.write(`❌ no flow directory at ${FLOW_DIR}\n`);
@@ -229,8 +227,8 @@ for (const name of ELEMS) {
 // Extract usage sites first: config-ref is an attribute on THIS connector's
 // own operation/source elements, so the prefix-scoped usage_sites are the
 // authoritative source for configs_used. Grepping every `config-ref="..."`
-// across all flow files (the pre-2.0.0 behaviour) leaked the app-wide config
-// union into every connector's file — making configs_used meaningless
+// across all flow files would leak the app-wide config union into every
+// connector's file — making configs_used meaningless
 // per-connector and, worse, never-empty, so the not_in_use gate below could
 // never fire for a genuinely-unused connector (e.g. vm declared-but-unused).
 const usage_sites = extractUsageSites(FLOW_FILES, PREFIX);
@@ -278,9 +276,9 @@ const record = {
   sources_used: unique(sources_used),
   configs_used: unique(configs_used),
   config_providers_used: unique(config_providers_used),
-  // Matches the pre-2.0.0 bash: known-provider hits + unknown-to-metadata
-  // hits. config_elems_used lives in the classification tree but is NOT
-  // emitted into this array — Phase C reads .configs[] instead.
+  // Known-provider hits + unknown-to-metadata hits. config_elems_used lives
+  // in the classification tree but is NOT emitted into this array — Phase C
+  // reads .configs[] instead.
   child_elements_used: unique(child_elements_used),
   errorTypes_caught,
   errorTypes_raised,

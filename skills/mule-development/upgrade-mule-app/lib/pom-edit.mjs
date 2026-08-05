@@ -1,9 +1,7 @@
 // pom-edit.mjs — deterministic pom.xml + mule-artifact.json + flow-XML edits.
 //
-// Ported 1:1 from the pre-2.0.0 Python helpers _apply_connector_pin.py and
-// _apply_runtime_bump.py. Behaviour, output shape, and edge cases are
-// preserved. Regex-based rewrite (matching the Python originals); no XML
-// parser dependency.
+// Regex-based rewrite — no XML parser dependency — so edits are surgical and
+// preserve the original file's whitespace/layout.
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
@@ -40,7 +38,7 @@ export function muleMavenPluginFor(runtime) {
 function _read(p) { return readFileSync(p, 'utf8'); }
 function _write(p, content) { writeFileSync(p, content); }
 
-// ---------- POM element replace / insert (from _apply_runtime_bump.py) ----------
+// ---------- POM element replace / insert ----------
 
 function _escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
@@ -95,7 +93,7 @@ export function insertProperty(text, tag, value) {
  * @param {string} pomPath
  * @param {string} targetMule
  * @param {string} targetJava
- * @param {Array<object>} log Mutated with per-file status entries (mirrors Python).
+ * @param {Array<object>} log Mutated with per-file status entries.
  */
 export function editPomRuntime(pomPath, targetMule, targetJava, log) {
   if (!existsSync(pomPath)) {
@@ -106,11 +104,15 @@ export function editPomRuntime(pomPath, targetMule, targetJava, log) {
   const original = text;
   const changes = [];
 
+  // Java-related tags: bumped in place only if present, never inserted when
+  // absent (a POM that doesn't declare them shouldn't sprout new ones).
   const tags = [
-    ['app.runtime', targetMule],
     ['javaVersion', targetJava],
     ['maven.compiler.source', targetJava],
     ['maven.compiler.target', targetJava],
+    ['maven.compiler.release', targetJava],
+    ['java.version', targetJava],
+    ['jdk.version', targetJava],
   ];
   for (const [tag, val] of tags) {
     const r = replaceElement(text, tag, val);
@@ -120,12 +122,17 @@ export function editPomRuntime(pomPath, targetMule, targetJava, log) {
     }
   }
 
-  // javaVersion is not universally present — insert if missing.
-  if (!text.includes('<javaVersion>')) {
-    const r = insertProperty(text, 'javaVersion', targetJava);
-    if (r.inserted) {
-      text = r.text;
-      changes.push(`javaVersion=${targetJava} (inserted)`);
+  // <app.runtime> is the one runtime property we always want present — bump it
+  // if declared, otherwise insert it into <properties>.
+  const rtReplace = replaceElement(text, 'app.runtime', targetMule);
+  if (rtReplace.changed) {
+    text = rtReplace.text;
+    changes.push(`app.runtime=${targetMule}`);
+  } else {
+    const rtInsert = insertProperty(text, 'app.runtime', targetMule);
+    if (rtInsert.inserted) {
+      text = rtInsert.text;
+      changes.push(`app.runtime=${targetMule} (inserted)`);
     }
   }
 
@@ -177,15 +184,15 @@ export function editMuleArtifact(artifactPath, targetMule, targetJava, log) {
     changes.push(`minMuleVersion=${targetMule}`);
   }
 
-  if (targetJava === '17' || targetJava === '21') {
-    const existing = artifact.javaSpecificationVersions;
-    if (!existing || (Array.isArray(existing) && existing.length === 0)) {
-      artifact.javaSpecificationVersions = [targetJava];
-      changes.push(`javaSpecificationVersions=[${targetJava}]`);
-    } else if (!existing.includes(targetJava)) {
-      artifact.javaSpecificationVersions = [...new Set([...existing, targetJava])];
-      changes.push(`javaSpecificationVersions+=${targetJava}`);
-    }
+  // Always ensure javaSpecificationVersions is present and includes the target
+  // Java, inserting the array if the manifest omits it entirely.
+  const existing = artifact.javaSpecificationVersions;
+  if (!existing || (Array.isArray(existing) && existing.length === 0)) {
+    artifact.javaSpecificationVersions = [targetJava];
+    changes.push(`javaSpecificationVersions=[${targetJava}]`);
+  } else if (!existing.includes(targetJava)) {
+    artifact.javaSpecificationVersions = [...new Set([...existing, targetJava])];
+    changes.push(`javaSpecificationVersions+=${targetJava}`);
   }
 
   if (changes.length > 0) {
@@ -196,11 +203,10 @@ export function editMuleArtifact(artifactPath, targetMule, targetJava, log) {
   }
 }
 
-// ---------- Connector pin (from _apply_connector_pin.py) ----------
+// ---------- Connector pin ----------
 
-// Minimal <element><child>…</child></element> plucker; regex-based, mirrors
-// Python's minidom behaviour on well-formed Maven pom.xml (elements only, no
-// namespaces on Maven POM tags).
+// Minimal <element><child>…</child></element> plucker; regex-based, relies on
+// well-formed Maven pom.xml (elements only, no namespaces on Maven POM tags).
 function _findDependencyBlocks(text) {
   const blocks = [];
   const depRe = /<dependency>([\s\S]*?)<\/dependency>/g;
@@ -363,52 +369,36 @@ export function editFlowXsdUrls(projectDir, namespacePrefix, namespaceMetadata, 
       const schemaLocValue = schemaLocMatch[1];
       const tokens = schemaLocValue.split(/\s+/).filter((t) => t.length > 0);
 
-      const updated = [];
-      let changed = false;
-      let i = 0;
-      while (i < tokens.length) {
-        if (i + 1 >= tokens.length) {
-          // Odd number of tokens — preserve as-is
-          updated.push(tokens[i]);
-          i += 1;
-          continue;
-        }
+      // Collect only XSD URLs that genuinely change (target namespace whose URL
+      // differs from newXsdUrl). Most URLs point at /current/ and don't change.
+      const oldXsdUrls = [];
+      for (let i = 0; i + 1 < tokens.length; i += 2) {
         const xmlnsUrl = tokens[i].trim();
         const xsdUrl = tokens[i + 1].trim();
-        if (xmlnsUrl === targetNsUrl || targetNsRe.test(xmlnsUrl)) {
-          updated.push(xmlnsUrl);
-          updated.push(newXsdUrl);
-          changed = true;
-        } else {
-          updated.push(xmlnsUrl);
-          updated.push(xsdUrl);
+        if ((xmlnsUrl === targetNsUrl || targetNsRe.test(xmlnsUrl)) && xsdUrl !== newXsdUrl) {
+          oldXsdUrls.push(xsdUrl);
         }
-        i += 2;
       }
 
-      if (!changed) {
+      if (oldXsdUrls.length === 0) {
         log.push({
           file: flowFile,
           status: 'skip',
-          reason: `namespace ${targetNsUrl} not found in schemaLocation`,
+          reason: `namespace ${targetNsUrl} not found or already current in schemaLocation`,
         });
         continue;
       }
 
-      // Reconstruct schemaLocation preserving the Python-style indentation.
-      const parts = [];
-      for (let j = 0; j < updated.length; j += 2) {
-        parts.push(`${updated[j]}\n        ${updated[j + 1]}`);
+      // Surgical in-place replace of just the changed URL token(s) — preserves
+      // the original whitespace/layout (no cosmetic reflow of the attribute).
+      let newContent = content;
+      for (const oldXsd of oldXsdUrls) {
+        newContent = newContent.replace(oldXsd, () => newXsdUrl);
       }
-      const newSchemaLocValue = '\n        ' + parts.join('\n        ');
-
-      const attrStart = schemaLocMatch.index + 'xsi:schemaLocation="'.length;
-      const attrEnd = attrStart + schemaLocValue.length;
-      const newContent = content.slice(0, attrStart) + newSchemaLocValue + content.slice(attrEnd);
 
       if (newContent !== content) {
         _write(flowFile, newContent);
-        log.push({ file: flowFile, status: 'ok', count: 1 });
+        log.push({ file: flowFile, status: 'ok', count: oldXsdUrls.length });
       } else {
         log.push({ file: flowFile, status: 'no-op' });
       }
@@ -418,7 +408,7 @@ export function editFlowXsdUrls(projectDir, namespacePrefix, namespaceMetadata, 
   }
 }
 
-// ---------- JAVA_HOME check (from _apply_runtime_bump.py) ----------
+// ---------- JAVA_HOME check ----------
 
 /**
  * @param {string} envPath Path to tmp/mule-dev-env.json.
