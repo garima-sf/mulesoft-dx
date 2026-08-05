@@ -1,9 +1,7 @@
 // xml-flow.mjs — flow-XML scanning primitives used by enumerate_usage.mjs.
 //
-// Pure, dependency-free helpers. Preserves the grep-based classification
-// behaviour of the pre-2.0.0 enumerate_usage.sh 1:1 — including the
+// Pure, dependency-free helpers implementing grep-based classification —
 // kebab→camel conversion, prefix-fallback rules, and attribute filters.
-// D-1 (structural rewrite) lands after this port; this module stays regex.
 import { readFileSync, readdirSync } from 'node:fs';
 
 /** @param {string} s @returns {string} Regex-escaped literal. */
@@ -14,8 +12,7 @@ export function escapeRegExp(s) {
 /**
  * Kebab-case → camelCase. `create-object` → `createObject`. Preserves the
  * first segment verbatim; capitalises the first letter of every subsequent
- * segment (empty segments preserved as empty strings, matching Python's
- * `str.capitalize()` on the empty string).
+ * segment (empty segments preserved as empty strings).
  * @param {string} s
  * @returns {string}
  */
@@ -31,9 +28,8 @@ export function kebabToCamel(s) {
  * @param {string} flowDir Path to `src/main/mule` (relative or absolute).
  * @returns {string[]} Sorted list of `*.xml` file paths. Uses string
  *   concatenation (not `path.join`) so the caller's `./` prefix is
- *   preserved verbatim in the emitted paths — matching the pre-2.0.0
- *   bash shell-glob `"$FLOW_DIR"/*.xml` behaviour that the usage-site
- *   JSON schema depends on.
+ *   preserved verbatim in the emitted paths — the usage-site JSON schema
+ *   depends on that leading `./`.
  */
 export function listFlowFiles(flowDir) {
   let entries;
@@ -159,8 +155,8 @@ function _grepErrorTypes(files, re, prefixUpper) {
 
 /**
  * Extract every child element inside `<prefix:*-config>...</prefix:*-config>`
- * blocks. Line-scan to mirror the pre-2.0.0 Python inside-block state
- * machine; returns kebab→camel-normalised child names.
+ * blocks. Line-scan inside-block state machine; returns kebab→camel-normalised
+ * child names.
  * @param {string[]} files
  * @param {string} prefix
  * @returns {string[]} Deduplicated in order of first occurrence.
@@ -203,7 +199,7 @@ export function extractConfigProviderChildren(files, prefix) {
  * Extract per-op usage sites — one row per `<prefix:name>` opener in the
  * flow XMLs, with the opening tag's attributes_set map.
  *
- * Attribute filter (from the pre-2.0.0 Python inline block):
+ * Attribute filter:
  * - Retain `doc:name`-style values? NO — skip anything with `doc:`, `xmlns:`,
  *   or `xsi:` prefix, and the bare `xmlns` attribute (they carry no
  *   connector-behavior signal).

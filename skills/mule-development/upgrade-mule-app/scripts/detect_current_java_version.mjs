@@ -10,8 +10,13 @@
 // javaSpecificationVersions (the only source): one entry → use it, multiple →
 // signal prompt-to-choose, absent/missing → signal prompt. Never prompts itself.
 //
+// When detection needs a prompt, the agent re-runs with --user-version <n> to
+// PERSIST the user's answer into the same output file — downstream steps (Step 4
+// resolve_target_versions.mjs) read it from disk, not the conversation. Also used
+// in Step 3a to record a corrected version.
+//
 // Usage:
-//   node detect_current_java_version.mjs [projectDir]
+//   node detect_current_java_version.mjs [projectDir] [--user-version <n>]
 //   Default projectDir = cwd. Output path: ${CURRENT_JAVA_VERSION_FILE} when set,
 //   otherwise <projectDir>/tmp/current-java-version.json.
 //
@@ -19,8 +24,8 @@
 //   belowFloor, minSupportedVersion, warnings[], notes[] }.
 //
 // Exit code:
-//   0  always — detection is advisory; the caller branches on version /
-//      needsUserPrompt / belowFloor rather than the exit status.
+//   0  always — advisory; the caller branches on version / needsUserPrompt /
+//      belowFloor rather than the exit status (both detected and --user-version).
 
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
@@ -47,8 +52,14 @@ function normalizeJava(v) {
 function main() {
   const argv = process.argv.slice(2);
   let projectDir = process.cwd();
+  let userVersion = null;
   for (let i = 0; i < argv.length; i++) {
-    if (!argv[i].startsWith("--")) projectDir = resolve(argv[i]);
+    if (argv[i] === "--user-version") {
+      userVersion = argv[i + 1] != null ? normalizeJava(argv[i + 1]) : null;
+      i++;
+    } else if (!argv[i].startsWith("--")) {
+      projectDir = resolve(argv[i]);
+    }
   }
   projectDir = resolve(projectDir);
   const outPath = process.env.CURRENT_JAVA_VERSION_FILE || join(projectDir, "tmp", "current-java-version.json");
@@ -64,6 +75,15 @@ function main() {
     warnings: [],
     notes: [],
   };
+
+  // --user-version: persist the user-supplied/corrected value (no mule-artifact.json
+  // re-read). emit() still applies the floor, flagging belowFloor for the caller.
+  if (userVersion != null) {
+    result.version = userVersion;
+    result.source = "user-supplied";
+    result.notes.push(`Java version ${userVersion} supplied by the user; persisted for downstream steps.`);
+    return emit(result, outPath);
+  }
 
   // mule-artifact.json is the only source.
   const artifactPath = join(projectDir, "mule-artifact.json");
@@ -128,7 +148,7 @@ function emit(result, outPath) {
   }
 
   if (result.belowFloor) {
-    log(`❌ Detected Java ${result.version} is below the minimum supported Java ${result.minSupportedVersion}.`);
+    log(`❌ Java ${result.version} is below the minimum supported Java ${result.minSupportedVersion}.`);
   } else if (result.version) {
     log(`✅ Current Java version: ${result.version}`);
   } else if (result.needsUserPrompt) {

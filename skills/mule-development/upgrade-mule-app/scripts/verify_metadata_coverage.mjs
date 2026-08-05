@@ -7,10 +7,8 @@
 // Part of upgrade-mule-app skill.
 //
 // Step 11.5 gate — verify Mode-A/B/C metadata coverage before Step 12
-// plan synthesis. Runs deterministically; no LLM.
-//
-// See the archived bash version's header (scripts/archive/verify_metadata_coverage.sh)
-// for the full contract, including the D7 empty-connectionProviders fallback.
+// plan synthesis. Runs deterministically; no LLM. Includes the
+// empty-connectionProviders fallback for degraded describes.
 //
 // Usage:
 //   node scripts/verify_metadata_coverage.mjs [--strict]

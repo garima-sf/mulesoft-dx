@@ -11,8 +11,13 @@
 // grandparent, ...). ${...} refs resolve against the merged properties of the whole
 // chain (nearer wins). Never prompts; signals the caller via needsUserPrompt.
 //
+// When detection needs a prompt, the agent re-runs with --user-version <v> to
+// PERSIST the user's answer into the same output file — downstream steps (Step 4
+// resolve_target_versions.mjs) read it from disk, not the conversation. Also used
+// in Step 3a to record a corrected version.
+//
 // Usage:
-//   node detect_current_mule_version.mjs [projectDir]
+//   node detect_current_mule_version.mjs [projectDir] [--user-version <v>]
 //   Default projectDir = cwd. Output path: ${CURRENT_MULE_VERSION_FILE} when set,
 //   otherwise <projectDir>/tmp/current-mule-version.json.
 //
@@ -20,8 +25,8 @@
 //   belowFloor, minSupportedVersion, warnings[], notes[] }.
 //
 // Exit code:
-//   0  always — detection is advisory; the caller branches on version /
-//      needsUserPrompt / belowFloor rather than the exit status.
+//   0  always — advisory; the caller branches on version / needsUserPrompt /
+//      belowFloor rather than the exit status (both detected and --user-version).
 
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
@@ -47,7 +52,7 @@ function log(msg) {
 const RUNTIME_PROPERTY_NAME = "app.runtime";
 
 // Lowest current version the skill upgrades from; below this is out of scope.
-const MIN_SUPPORTED_MULE_VERSION = "4.4";
+const MIN_SUPPORTED_MULE_VERSION = "4.3";
 
 // Read app.runtime from one POM's own properties, resolving ${...} against the
 // merged child+parent table. Returns { version, raw } or null (missing/unresolvable).
@@ -79,8 +84,14 @@ function numericParts(v) {
 function main() {
   const argv = process.argv.slice(2);
   let projectDir = process.cwd();
+  let userVersion = null;
   for (let i = 0; i < argv.length; i++) {
-    if (!argv[i].startsWith("--")) projectDir = resolve(argv[i]);
+    if (argv[i] === "--user-version") {
+      userVersion = argv[i + 1] != null ? String(argv[i + 1]).trim() : null;
+      i++;
+    } else if (!argv[i].startsWith("--")) {
+      projectDir = resolve(argv[i]);
+    }
   }
   projectDir = resolve(projectDir);
   const outPath = process.env.CURRENT_MULE_VERSION_FILE || join(projectDir, "tmp", "current-mule-version.json");
@@ -96,6 +107,16 @@ function main() {
     warnings: [],
     notes: [],
   };
+
+  // --user-version: persist the user-supplied/corrected value (no POM re-read).
+  // floorCheck() still applies the floor, flagging belowFloor for the caller.
+  if (userVersion != null) {
+    result.version = userVersion;
+    result.source = "user-supplied";
+    result.notes.push(`Mule Runtime ${userVersion} supplied by the user; persisted for downstream steps.`);
+    floorCheck(result);
+    return emit(result, outPath);
+  }
 
   // Child pom.xml is required.
   const childPomPath = join(projectDir, "pom.xml");
@@ -187,24 +208,27 @@ function main() {
     }
   }
 
-  // Floor check applies only to a detected version; the caller floor-checks
-  // any user-supplied value (SKILL.md).
+  floorCheck(result);
+
+  return emit(result, outPath);
+}
+
+// Flag a below-floor version (detected or user-supplied) for the caller.
+function floorCheck(result) {
   if (result.version && compareVersions(result.version, MIN_SUPPORTED_MULE_VERSION) < 0) {
     result.belowFloor = true;
     result.warnings.push(
-      `Detected Mule Runtime version ${result.version} is below the minimum ` +
+      `Mule Runtime version ${result.version} is below the minimum ` +
       `supported version (${MIN_SUPPORTED_MULE_VERSION}). This skill only upgrades ` +
       `apps already on Mule ${MIN_SUPPORTED_MULE_VERSION}+. Upgrade the app to at ` +
       `least ${MIN_SUPPORTED_MULE_VERSION} before running this skill.`
     );
   }
-
-  return emit(result, outPath);
 }
 
 function emit(result, outPath) {
   if (result.belowFloor) {
-    log(`❌ Detected Mule Runtime ${result.version} is below the minimum supported ${result.minSupportedVersion}.`);
+    log(`❌ Mule Runtime ${result.version} is below the minimum supported ${result.minSupportedVersion}.`);
   } else if (result.version) {
     const from = result.resolvedFrom ? ` (from ${result.resolvedFrom} pom.xml)` : "";
     log(`✅ Current Mule Runtime: ${result.version}${from}`);
