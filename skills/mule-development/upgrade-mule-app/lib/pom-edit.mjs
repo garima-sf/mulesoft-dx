@@ -5,36 +5,6 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
-// ---------- runtime → mule-maven-plugin matrix ----------
-// Keep in sync with references/runtime-bump-matrix.md.
-const MULE_MAVEN_PLUGIN_MATRIX = {
-  '4.3.0': '3.6.1',
-  '4.3.': '3.6.1',
-  '4.4.0': '3.8.0',
-  '4.4.': '3.8.0',
-  '4.5.0': '4.1.0',
-  '4.5.': '4.1.0',
-  '4.6.0': '4.3.0',
-  '4.6.': '4.3.0',
-  '4.7.0': '4.4.0',
-  '4.7.': '4.4.0',
-  '4.8.0': '4.6.0',
-  '4.8.': '4.6.0',
-  '4.9.0': '4.9.0',
-  '4.9.': '4.9.0',
-  '4.10.0': '4.10.1',
-  '4.10.': '4.10.1',
-};
-
-/** @param {string} runtime Mule runtime version. @returns {string|null} Longest-prefix mule-maven-plugin match, e.g. 4.6.1 → matrix['4.6.']. */
-export function muleMavenPluginFor(runtime) {
-  const keys = Object.keys(MULE_MAVEN_PLUGIN_MATRIX).sort((a, b) => b.length - a.length);
-  for (const k of keys) {
-    if (runtime.startsWith(k)) return MULE_MAVEN_PLUGIN_MATRIX[k];
-  }
-  return null;
-}
-
 function _read(p) { return readFileSync(p, 'utf8'); }
 function _write(p, content) { writeFileSync(p, content); }
 
@@ -93,9 +63,11 @@ export function insertProperty(text, tag, value) {
  * @param {string} pomPath
  * @param {string} targetMule
  * @param {string} targetJava
+ * @param {string|null} muleMavenPlugin Resolved latest MMP version (Step 11a),
+ *   or null/empty to leave <mule.maven.plugin.version> untouched.
  * @param {Array<object>} log Mutated with per-file status entries.
  */
-export function editPomRuntime(pomPath, targetMule, targetJava, log) {
+export function editPomRuntime(pomPath, targetMule, targetJava, muleMavenPlugin, log) {
   if (!existsSync(pomPath)) {
     log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found' });
     return;
@@ -136,24 +108,38 @@ export function editPomRuntime(pomPath, targetMule, targetJava, log) {
     }
   }
 
-  const mmp = muleMavenPluginFor(targetMule);
+  const mmp = muleMavenPlugin;
   if (mmp) {
+    // Prefer the property form: bump <mule.maven.plugin.version> if declared.
     const rr = replaceElement(text, 'mule.maven.plugin.version', mmp);
     if (rr.changed) {
       text = rr.text;
       changes.push(`mule.maven.plugin.version=${mmp}`);
     } else {
-      const ins = insertProperty(text, 'mule.maven.plugin.version', mmp);
-      if (ins.inserted) {
-        text = ins.text;
-        changes.push(`mule.maven.plugin.version=${mmp} (inserted)`);
+      // No such property. If the plugin pins its version as a LITERAL inside the
+      // <plugin> block, edit that in place (same writer the Step 3c baseline uses);
+      // otherwise insert the property.
+      const lit = _setPluginVersionInText(text, {
+        groupId: 'org.mule.tools.maven',
+        artifactId: 'mule-maven-plugin',
+        version: mmp,
+      });
+      if (lit.changed) {
+        text = lit.text;
+        changes.push(`mule-maven-plugin <version>=${mmp} (literal)`);
+      } else {
+        const ins = insertProperty(text, 'mule.maven.plugin.version', mmp);
+        if (ins.inserted) {
+          text = ins.text;
+          changes.push(`mule.maven.plugin.version=${mmp} (inserted)`);
+        }
       }
     }
   } else {
     log.push({
       file: pomPath,
       status: 'warn',
-      reason: `no mule-maven-plugin matrix entry for ${targetMule} — leaving unchanged`,
+      reason: 'no mule-maven-plugin version supplied (Step 11a) — leaving <mule.maven.plugin.version> unchanged',
     });
   }
 
@@ -163,6 +149,21 @@ export function editPomRuntime(pomPath, targetMule, targetJava, log) {
   } else {
     log.push({ file: pomPath, status: 'no-op', changes: [] });
   }
+}
+
+/**
+ * Truncate a Mule runtime version to its `x.y.0` feature line for
+ * `minMuleVersion`, which declares the app's required features by the MINOR
+ * line, not the patch (4.9.19 → 4.9.0). This matches how ACB and Studio write
+ * the manifest, and the Introspection Service depends on the minor-line form.
+ * `<app.runtime>` keeps the full patch. Returns the input unchanged if it
+ * doesn't parse as `major.minor.patch...`.
+ * @param {string} v e.g. "4.9.19"
+ * @returns {string} e.g. "4.9.0"
+ */
+function _featureLineVersion(v) {
+  const m = String(v).match(/^(\d+)\.(\d+)\./);
+  return m ? `${m[1]}.${m[2]}.0` : v;
 }
 
 /**
@@ -179,9 +180,19 @@ export function editMuleArtifact(artifactPath, targetMule, targetJava, log) {
   const artifact = JSON.parse(_read(artifactPath));
   const changes = [];
 
-  if (artifact.minMuleVersion !== targetMule) {
-    artifact.minMuleVersion = targetMule;
-    changes.push(`minMuleVersion=${targetMule}`);
+  // minMuleVersion is the x.y.0 feature line (see _featureLineVersion), NOT the
+  // full patch — this is the platform-correct form (ACB/Studio write it this way
+  // and the Introspection Service depends on it). <app.runtime> (editPomRuntime)
+  // keeps the full patch. The one hazard of the floor is that MUnit's embedded
+  // test runtime otherwise defaults to minMuleVersion, so a 4.9.0 floor would
+  // boot the 4.9.0 runtime whose mule-sdk-api enum lacks newer JavaVersion
+  // constants (e.g. JAVA_25) and fail connector extension-model parsing; that is
+  // handled separately by pinning <runtimeVersion>${app.runtime}</runtimeVersion>
+  // in the munit-maven-plugin config (see editMunitVersion).
+  const minMule = _featureLineVersion(targetMule);
+  if (artifact.minMuleVersion !== minMule) {
+    artifact.minMuleVersion = minMule;
+    changes.push(`minMuleVersion=${minMule}`);
   }
 
   // Always ensure javaSpecificationVersions is present and includes the target
@@ -322,6 +333,282 @@ export function editPomDependency(pomPath, gav, log) {
   const newText = text.slice(0, matched.start) + newFull + text.slice(matched.end);
   _write(pomPath, newText);
   log.push({ file: pomPath, status: 'ok', from: oldVersion, to: newVersion });
+}
+
+// ---------- Plugin version pin ----------
+
+function _findPluginBlocks(text) {
+  const blocks = [];
+  const re = /<plugin>([\s\S]*?)<\/plugin>/g;
+  for (const m of text.matchAll(re)) {
+    blocks.push({ start: m.index, end: m.index + m[0].length, inner: m[1], full: m[0] });
+  }
+  return blocks;
+}
+
+/**
+ * Text-level transform: set the LITERAL `<version>` of every `<plugin>` block
+ * matching artifactId (+ groupId when declared) to `newVersion`. Rewrites ONLY
+ * the version inside matched plugin blocks — never a bare `<version>` elsewhere
+ * — so POMs with multiple plugin blocks (build/plugins + pluginManagement) stay
+ * safe. A `${property}` version is left untouched (that is the -D path).
+ * @param {string} text
+ * @param {{groupId?:string, artifactId:string, version:string}} target
+ * @returns {{text:string, changed:boolean, matched:boolean, results:Array<object>}}
+ */
+function _setPluginVersionInText(text, target) {
+  const { groupId, artifactId, version: newVersion } = target;
+  const blocks = _findPluginBlocks(text);
+  const matches = blocks.filter((b) => {
+    if (_pluckChild(b.inner, 'artifactId') !== artifactId) return false;
+    const gid = _pluckChild(b.inner, 'groupId');
+    return !groupId || !gid || gid === groupId;
+  });
+
+  let changed = false;
+  const results = [];
+  // Rebuild the document back-to-front so earlier edits don't shift later offsets.
+  for (const b of [...matches].sort((a, c) => c.start - a.start)) {
+    const vMatch = b.inner.match(/<version>([^<]*)<\/version>/);
+    if (!vMatch) {
+      results.push({ status: 'skip', reason: 'no <version> in plugin block' });
+      continue;
+    }
+    const vText = vMatch[1].trim();
+    if (/^\$\{[^}]+\}$/.test(vText)) {
+      results.push({ status: 'skip', from: vText, reason: 'version is a ${property} — override with -D instead' });
+      continue;
+    }
+    if (vText === newVersion) {
+      results.push({ status: 'no-op', from: vText, to: newVersion });
+      continue;
+    }
+    const innerNew = b.inner.replace(/<version>[^<]*<\/version>/, `<version>${newVersion}</version>`);
+    text = text.slice(0, b.start) + `<plugin>${innerNew}</plugin>` + text.slice(b.end);
+    changed = true;
+    results.push({ status: 'ok', from: vText, to: newVersion });
+  }
+  return { text, changed, matched: matches.length > 0, results };
+}
+
+/**
+ * Text-level transform: set the LITERAL `<version>` of every `<dependency>`
+ * block matching artifactId (+ groupId when declared) to `newVersion`. Same
+ * contract as `_setPluginVersionInText` but for dependency blocks — rewrites
+ * back-to-front, skips `${property}` versions (those ride a shared property that
+ * is bumped separately), and never touches a bare `<version>` elsewhere.
+ * @param {string} text
+ * @param {{groupId?:string, artifactId:string, version:string}} target
+ * @returns {{text:string, changed:boolean, matched:boolean, results:Array<object>}}
+ */
+function _setDependencyVersionInText(text, target) {
+  const { groupId, artifactId, version: newVersion } = target;
+  const blocks = _findDependencyBlocks(text);
+  const matches = blocks.filter((b) => {
+    if (_pluckChild(b.inner, 'artifactId') !== artifactId) return false;
+    const gid = _pluckChild(b.inner, 'groupId');
+    return !groupId || !gid || gid === groupId;
+  });
+
+  let changed = false;
+  const results = [];
+  for (const b of [...matches].sort((a, c) => c.start - a.start)) {
+    const vMatch = b.inner.match(/<version>([^<]*)<\/version>/);
+    if (!vMatch) {
+      results.push({ status: 'skip', reason: 'no <version> in dependency block' });
+      continue;
+    }
+    const vText = vMatch[1].trim();
+    if (/^\$\{[^}]+\}$/.test(vText)) {
+      results.push({ status: 'skip', from: vText, reason: 'version is a ${property} — bumped via the property' });
+      continue;
+    }
+    if (vText === newVersion) {
+      results.push({ status: 'no-op', from: vText, to: newVersion });
+      continue;
+    }
+    const innerNew = b.inner.replace(/<version>[^<]*<\/version>/, `<version>${newVersion}</version>`);
+    text = text.slice(0, b.start) + `<dependency>${innerNew}</dependency>` + text.slice(b.end);
+    changed = true;
+    results.push({ status: 'ok', from: vText, to: newVersion });
+  }
+  return { text, changed, matched: matches.length > 0, results };
+}
+
+/**
+ * Bump every MUnit version site in pom.xml to `version`, deterministically.
+ *
+ * MUnit spreads across up to three shapes, and a real pom can mix them (a
+ * `<munit.version>` property that some artifacts reference and others ignore in
+ * favour of a hardcoded literal — seen in the wild). This bumps all of them in
+ * one pass so no site is left stale:
+ *   - the `<munit.version>` property (if declared),
+ *   - the `munit-maven-plugin` `<plugin>` block's literal version,
+ *   - the `munit-runner` / `munit-tools` `<dependency>` blocks' literal versions.
+ * Every writer skips `${property}` versions (those already ride the property
+ * bumped above), so a property-driven pom is a single clean edit and a
+ * literal-driven pom rewrites each element. All artifacts are under groupId
+ * `com.mulesoft.munit`.
+ *
+ * @param {string} pomPath
+ * @param {string|null} version Latest MUnit resolved live (Step 11a), or null/empty to skip.
+ * @param {Array<object>} log Mutated with a per-file status entry.
+ */
+export function editMunitVersion(pomPath, version, log) {
+  if (!existsSync(pomPath)) {
+    log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found' });
+    return;
+  }
+  if (!version) {
+    log.push({ file: pomPath, status: 'warn', reason: 'no MUnit version supplied (Step 11a) — leaving MUnit versions unchanged' });
+    return;
+  }
+  let text = _read(pomPath);
+  const original = text;
+  const changes = [];
+  const GROUP = 'com.mulesoft.munit';
+
+  const prop = replaceElement(text, 'munit.version', version);
+  if (prop.changed) {
+    text = prop.text;
+    changes.push(`munit.version=${version}`);
+  }
+
+  const plug = _setPluginVersionInText(text, { groupId: GROUP, artifactId: 'munit-maven-plugin', version });
+  if (plug.changed) {
+    text = plug.text;
+    changes.push(`munit-maven-plugin <version>=${version} (literal)`);
+  }
+
+  for (const artifactId of ['munit-runner', 'munit-tools']) {
+    const dep = _setDependencyVersionInText(text, { groupId: GROUP, artifactId, version });
+    if (dep.changed) {
+      text = dep.text;
+      changes.push(`${artifactId} <version>=${version} (literal)`);
+    }
+  }
+
+  if (text !== original) {
+    _write(pomPath, text);
+    log.push({ file: pomPath, status: 'applied', changes });
+  } else {
+    log.push({ file: pomPath, status: 'no-op', changes: [] });
+  }
+}
+
+/**
+ * Pin the munit-maven-plugin's embedded test runtime to `<app.runtime>` by
+ * inserting `<runtimeVersion>${app.runtime}</runtimeVersion>` into its
+ * `<configuration>` block.
+ *
+ * Why this is required: MUnit selects its embedded runtime from
+ * `<runtimeVersion>` when set, otherwise it falls back to the app's
+ * `minMuleVersion` from mule-artifact.json. Since we (correctly) write
+ * `minMuleVersion` as the `x.y.0` feature line, that fallback would boot the
+ * `x.y.0` runtime — whose bundled `mule-sdk-api` `JavaVersion` enum can lack
+ * newer constants (e.g. JAVA_25). Connectors compiled against the target
+ * patch's `@SupportedJavaVersions` then throw `EnumConstantNotPresentException`
+ * during extension-model parsing and MUnit never runs. Pinning `runtimeVersion`
+ * to `${app.runtime}` (the full target patch, set by editPomRuntime) forces the
+ * test runtime to match the deploy runtime, independent of the feature-line
+ * floor.
+ *
+ * Uses the `${app.runtime}` property (not a literal) so the test runtime tracks
+ * the same single source of truth the deploy profiles use. Insert-if-absent:
+ * an existing `<runtimeVersion>` (a team's deliberate pin) is left untouched.
+ * No-op when the munit-maven-plugin block is absent.
+ *
+ * @param {string} pomPath
+ * @param {Array<object>} log Mutated with a per-file status entry.
+ */
+export function editMunitRuntimeVersion(pomPath, log) {
+  if (!existsSync(pomPath)) {
+    log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found' });
+    return;
+  }
+  let text = _read(pomPath);
+  const RUNTIME_REF = '${app.runtime}';
+
+  const blocks = _findPluginBlocks(text);
+  const block = blocks.find((b) => _pluckChild(b.inner, 'artifactId') === 'munit-maven-plugin');
+  if (!block) {
+    log.push({ file: pomPath, status: 'no-op', reason: 'munit-maven-plugin block not found' });
+    return;
+  }
+
+  // Already pinned — never clobber a deliberate value.
+  if (/<runtimeVersion>/.test(block.inner)) {
+    log.push({ file: pomPath, status: 'no-op', reason: 'runtimeVersion already present' });
+    return;
+  }
+
+  // Match the block's indentation from its <configuration> (or <version>) tag.
+  const indentMatch = block.inner.match(/\n([ \t]+)<(?:configuration|version)>/);
+  const cfgIndent = indentMatch ? indentMatch[1] : '\t\t\t\t';
+  const childIndent = cfgIndent + (cfgIndent.includes('\t') ? '\t' : '  ');
+  const rtEl = `<runtimeVersion>${RUNTIME_REF}</runtimeVersion>`;
+
+  let innerNew;
+  const cfgOpen = block.inner.match(/<configuration>/);
+  if (cfgOpen) {
+    // Insert as the first child of the existing <configuration>.
+    innerNew = block.inner.replace(
+      /<configuration>/,
+      `<configuration>\n${childIndent}${rtEl}`
+    );
+  } else {
+    // No <configuration> — add one just before the plugin block closes.
+    innerNew = block.inner.replace(
+      /([ \t]*)$/,
+      `${cfgIndent}<configuration>\n${childIndent}${rtEl}\n${cfgIndent}</configuration>\n$1`
+    );
+  }
+
+  const newText = text.slice(0, block.start) + `<plugin>${innerNew}</plugin>` + text.slice(block.end);
+  if (newText !== text) {
+    _write(pomPath, newText);
+    log.push({ file: pomPath, status: 'applied', changes: [`munit-maven-plugin <runtimeVersion>=${RUNTIME_REF} (inserted)`] });
+  } else {
+    log.push({ file: pomPath, status: 'no-op', changes: [] });
+  }
+}
+
+/**
+ * Set the `<version>` of a specific `<plugin>` (matched by artifactId, and
+ * groupId when the block declares one) to `newVersion`, in place.
+ *
+ * This is the LITERAL-version writer that `-D<prop>` cannot cover: when a POM
+ * hardcodes `<version>x.y.z</version>` inside the plugin block (e.g.
+ * mule-maven-plugin pinned as a literal), the command-line override is ignored,
+ * so the element must be edited. Skips (no-op) when the plugin's version is a
+ * `${property}` reference — that is the Case-A path handled on the command line.
+ * Whitespace/tabs inside the block are irrelevant — matching is structural.
+ *
+ * @param {string} pomPath
+ * @param {{groupId?:string, artifactId:string, version:string}} target
+ * @param {Array<object>} log
+ */
+export function editPluginVersion(pomPath, target, log) {
+  if (!existsSync(pomPath)) {
+    log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found' });
+    return;
+  }
+  let text;
+  try {
+    text = _read(pomPath);
+  } catch (e) {
+    log.push({ file: pomPath, status: 'error', reason: `read failed: ${e.message}` });
+    return;
+  }
+
+  const r = _setPluginVersionInText(text, target);
+  if (!r.matched) {
+    const { groupId, artifactId } = target;
+    log.push({ file: pomPath, status: 'not-found', reason: `plugin ${groupId ? groupId + ':' : ''}${artifactId} not found` });
+    return;
+  }
+  if (r.changed) _write(pomPath, r.text);
+  log.push({ file: pomPath, status: r.changed ? 'ok' : 'no-op', plugin: target.artifactId, results: r.results });
 }
 
 /**

@@ -61,11 +61,12 @@ This skill ships small Node.js (ESM, zero-dep) scripts under `scripts/`. Invoke 
 
 | Script | Purpose | Output location |
 | --- | --- | --- |
-| `scripts/validate_prerequisites.mjs` | Step 1 — validate app directory (`pom.xml` + `mule-artifact.json`), parent-POM availability (if referenced), Anypoint CLI v4, DX plugin. Validation-ONLY; exits non-zero when `errors[]` is non-empty | `tmp/upgrade-prereqs.json` (contains `inAppDir`, `parentDeclared`, `parentFound`, `cliPresent`, `dxPluginPresent`, `errors[]`, ...) |
+| `scripts/validate_prerequisites.mjs` | Step 1 — validate app directory (`pom.xml` + `mule-artifact.json`), parent-POM availability (if referenced), Anypoint CLI v4, DX plugin, and local **Maven on the 3.9.x line** (MMP 4.x + MUnit require it; detect-and-instruct, never install). Validation-ONLY; exits non-zero when `errors[]` is non-empty | `tmp/upgrade-prereqs.json` (contains `inAppDir`, `parentDeclared`, `parentFound`, `cliPresent`, `dxPluginPresent`, `mavenVersion`, `mavenInRange`, `errors[]`, ...) |
 | `scripts/detect_current_mule_version.mjs` | Step 2a — determine the current Mule Runtime version from the `app.runtime` property, searching the child `pom.xml` then its full local parent chain (parent, grandparent, …) with `${...}` resolved against the merged chain, and flag versions below the supported floor (4.3). `--user-version <v>` persists a user-supplied/corrected value (also flagged via `belowFloor`) | `tmp/current-mule-version.json` (contains `version`, `source`, `resolvedFrom` (`"child"` \| `"parent"` \| `"ancestor"`), `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
 | `scripts/detect_current_java_version.mjs` | Step 2b — determine the current Java version from `mule-artifact.json` `javaSpecificationVersions`, and flag versions below the supported floor (8). `--user-version <n>` persists a user-supplied/corrected value (also flagged via `belowFloor`) | `tmp/current-java-version.json` (contains `version`, `source`, `supportedVersions`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
 | `scripts/resolve_jdk.mjs` | Step 3 & Phase 2 — ensure a JDK for a given Java **major** is available and report a usable `JAVA_HOME`. Resolves major → full build string (e.g. `8` → `8.0.472_8`) via `dx mule runtime list` (matrix-file fallback), reuses an already-installed JDK under the Anypoint Code Builder java dir, and downloads only when none is present. MAY download (network) unless `--no-download` | `tmp/resolve-jdk-<major>.json` (contains `major`, `requestedBuild`, `javaHome`, `javaBin`, `source`, `downloaded`, `available`, `errors[]`, ...) |
-| `scripts/check_maven_compat.mjs` | Step 3c (pre-build) — verify the **local** `mvn` version is compatible with the app's **current** `mule-maven-plugin` (read from the child `pom.xml` then its local parent chain, `${...}` resolved). HARD-STOPS (exit 1) when a 3.x plugin would run on Maven ≥ 3.9 — the mismatch that crashes with `NoClassDefFoundError: …BasicRepositoryConnectorFactory` — with a fix-it message pointing at Maven 3.8.x. Validation-ONLY; no download, no mutation. Passes (exit 0) when compatible or when no explicit plugin version is resolvable locally | `tmp/maven-compat.json` (contains `mavenVersion`, `mavenMajor`, `mavenMinor`, `pluginVersion`, `pluginMajor`, `pluginDefinedIn`, `compatible`, `errors[]`, `warnings[]`, ...) |
+| `scripts/detect_current_mmp_version.mjs` | Step 3c (pre-build) — detect the app's **current** `mule-maven-plugin` version (read from the child `pom.xml` then its local parent chain, `${...}` resolved) so Step 3c knows whether to bump MMP for the baseline. Sets `needsPluginBump: true` when the current MMP is < 4.x (3.x can't run on the required Maven 3.9.x → bump to latest 4.x for the baseline build only). Does **not** assert Maven compatibility (that moved to the Step 1 Maven-3.9.x pre-req) and never emits a "use Maven 3.8" fix. Validation-ONLY; no download, no mutation | `tmp/current-mmp.json` (contains `pluginVersion`, `pluginMajor`, `pluginDefinedIn`, `needsPluginBump`, `errors[]`, `warnings[]`, ...) |
+| `scripts/set_plugin_version.mjs` | Step 3c **Case B** (literal MMP) — deterministically set a plugin's hardcoded `<version>` in `pom.xml` when `-D` can't override it. Matches the plugin block by `artifactId` (+ `groupId` when declared) and rewrites only that block's `<version>`, whitespace/tab-agnostic; leaves `${property}` versions untouched (that's the `-D` Case-A path) and safely handles POMs with multiple plugin blocks (build/plugins + pluginManagement). Callers revert the pom after the throwaway baseline build. Exit 0 on edit/no-op, 1 on not-found/error | stdout JSON `{artifactId, version, groupId, edits[]}` (mutates `pom.xml`) |
 | `scripts/resolve_runtime.mjs` | Step 13 — ensure the **target** Mule Runtime distribution is present and report its `runtimePath`. Reuses an installed `mule-enterprise-standalone-<version>` under the Anypoint Code Builder runtime dir, else downloads it via `dx mule runtime download` — only if `dx mule runtime list` offers that version. MAY download (network) unless `--no-download`. Never sets a runtime path | `tmp/resolve-runtime-<version>.json` (contains `version`, `resolvedVersion`, `runtimePath`, `source`, `downloaded`, `available`, `errors[]`, ...) |
 | `scripts/resolve_target_versions.mjs` | Step 4 — determine the recommended upgrade target (in-channel: highest minor, latest patch, latest non-EOL Java) from the current versions + live `dx mule runtime list`, and validate a user-requested target (`TARGET_MULE`/`TARGET_JAVA`) against the locked policy. Advisory — always exits 0; caller branches on fields | `tmp/target-versions.json` (contains `currentMule`, `currentJava`, `channel`, `options[]`, `requestedTarget` {`accepted`, `mule`, `java`, `reasonCode`, `reason`, `crossChannel`, `warning`, `belowRecommended`, `note`}, `requestedJavaOnly` {`java`, `supported`, `supportedJavas[]`, `recommendedMule`, `recommendedJava`, `note`}, `nothingToUpgrade`, `needsUserPrompt`, `warnings[]`, ...) |
 | `scripts/extract_connectors.mjs` | Step 5a — extract the connector dependencies (`<classifier>mule-plugin</classifier>`, non-test-scoped) from the app's `pom.xml` and its full local ancestor chain (parent, grandparent, …), resolving each version from the local POMs: inline, `${...}` (single, nested, or composite like `${major}.${minor}`), inherited `<dependencies>`, and version-less deps managed in any local `<dependencyManagement>` (this POM's own or an ancestor's). Deterministic static parse; no CLI, no network. Advisory — always exits 0 | `tmp/connectors.json` (contains `connectors[]` {`nick`, `groupId`, `artifactId`, `version`, `versionResolved`, `resolvedFrom`, `versionManagedIn?`}, `excluded[]` (test-scoped), `needsUserPrompt`, `warnings[]`, ...) |
@@ -76,7 +77,7 @@ This skill ships small Node.js (ESM, zero-dep) scripts under `scripts/`. Invoke 
 | `enumerate_usage_xml.mjs` | **Preferred** usage enumerator — parses `src/main/mule/**/*.xml` with `fast-xml-parser`. Identical output to `enumerate_usage.mjs` but correct on messy input (ignores commented-out elements; binds `config-ref` to its owning element). Exits rc=3 if `fast-xml-parser` isn't importable → caller falls back to the grep script. See Step 7 "Usage enumeration". | `tmp/connector-usage/<nick>.json` |
 | `enumerate_usage.mjs` | Zero-dependency (regex/grep) usage enumerator — the fallback for `enumerate_usage_xml.mjs`. Scans `src/main/mule/**/*.xml` for a connector's ops, configs, error types, namespace prefix used by the app. The OLD-side source of truth — replaces re-describing the old connector version. See Step 7b (usage enumeration + output shape). | `tmp/connector-usage/<nick>.json` |
 | `apply_connector_pin.mjs` | Bumps one connector's version in `pom.xml` and rewrites its `xsi:schemaLocation` in every flow XML. Reads `tmp/connector-choices/<nick>-new.json` (GAV, required) and `tmp/connector-metadata/<nick>-new.json` (namespace metadata, **optional** — absent for pom-only connectors, in which case the XSD rewrite no-ops). Deterministic — never hand-edit `xsi:schemaLocation`. | mutates `pom.xml` + `src/main/mule/**/*.xml` |
-| `apply_runtime_bump.mjs` | Ensures `<app.runtime>` (bumped, or inserted if absent); bumps `<javaVersion>`, `maven.compiler.{source,target,release}`, `java.version`, `jdk.version` **only if present**; bumps/inserts `<mule.maven.plugin.version>` in `pom.xml`; sets `minMuleVersion` and ensures `javaSpecificationVersions` contains the target Java in `mule-artifact.json`. All values read from `tmp/upgrade-targets.json` (`.mule.to` / `.java.to`) — nothing hardcoded. Matrix in `references/runtime-bump-matrix.md`. Exits 2 if running Java doesn't match the target. | mutates `pom.xml` + `mule-artifact.json` |
+| `apply_runtime_bump.mjs` | Ensures `<app.runtime>` (bumped, or inserted if absent); bumps `<javaVersion>`, `maven.compiler.{source,target,release}`, `java.version`, `jdk.version` **only if present**; bumps/inserts `<mule.maven.plugin.version>`; bumps every MUnit version site (the `<munit.version>` property, the `munit-maven-plugin` plugin block, and the `munit-runner`/`munit-tools` dependencies) in `pom.xml`; inserts `<runtimeVersion>${app.runtime}</runtimeVersion>` into the `munit-maven-plugin` config (insert-if-absent, never clobbers an existing pin); sets `minMuleVersion` to the **`x.y.0` feature line** (platform-correct — matches ACB/Studio, the Introspection Service needs the minor-line form) and ensures `javaSpecificationVersions` contains the target Java in `mule-artifact.json`. The `runtimeVersion` pin is what lets the feature-line floor be correct without regressing tests: MUnit's embedded runtime defaults to `minMuleVersion` otherwise, and an `x.y.0` floor would boot an older runtime that fails JAVA_25-annotated connectors with `EnumConstantNotPresentException`. All values read from `tmp/upgrade-targets.json` (`.mule.to` / `.java.to` / `.muleMavenPlugin.to` / `.munit.to`) — nothing hardcoded. `.muleMavenPlugin.to` and `.munit.to` are resolved live in Step 11a; if either is absent, the corresponding versions are left unchanged. Exits 2 if running Java doesn't match the target. | mutates `pom.xml` + `mule-artifact.json` |
 | `promote_new_connector_pins.mjs` | Copies every `tmp/connector-choices/<nick>-new.json` → `tmp/connector-versions/<nick>.json` so Phase 2's pin script can consume them. Run once, before `apply_connector_pin.mjs`. | `tmp/connector-versions/<nick>.json` |
 | `verify_metadata_coverage.mjs` | Step 11.5 gate — for every op / source / provider in `tmp/connector-usage/*.json`, verify a Mode-B / Mode-C JSON exists in `tmp/connector-metadata/`. Exits 1 with FAIL rows when any required per-op / per-provider describe is missing. Configs whose Mode-A `.connectionProviders[]` is empty (D7 fallback — some DB configs) emit INFO and do not fail; Phase C reads Mode-A `.configs[]` directly for those. Optional `--strict` also fails on WARN rows (renamed / removed ops that lack a `<nick>-op-renames.json` entry). | stdout FAIL/WARN/INFO rows |
 
@@ -127,6 +128,7 @@ It writes the validation findings to `tmp/upgrade-prereqs.json` (read fields wit
 - **Not in an app directory** (`pom.xml` / `mule-artifact.json` missing) → tell the user to run from the Mule application root.
 - **Parent POM declared but not found locally** (`parentDeclared: true`, `parentFound: false`) → the parent is required both for version detection (Step 2) and for Phase 2 edits (inherited connector/plugin versions, Steps 14/18). Ask the user to make the parent POM available at a local relative path (resolvable from the child's `<parent><relativePath>`, or the default `../pom.xml`) and re-run. **Do not attempt to download it.**
 - **Toolchain missing** (`cliPresent` / `dxPluginPresent` false) → point the user at the install commands in Prerequisites.
+- **Maven not on the 3.9.x line** (`mavenInRange: false`) → MMP 4.x and MUnit require Maven **3.9.x**, and the baseline build (Step 3c) runs on a 4.x MMP. Tell the user to switch to an Apache Maven 3.9.x distribution (put its `bin/` first on `PATH` for this session) and re-run. **Do not download or auto-install Maven, and do not suggest a bare package-manager `install maven`** — those pull whatever is latest (often 4.x, or an old 3.6.x), which fails this very check. Maven is a standard developer toolchain, treated as a pre-req like the CLI/DX plugin.
 
 Only proceed to Step 2 once the script exits zero.
 
@@ -228,25 +230,51 @@ This is the same helper Phase 2 uses for the target Java — run it once per Jav
 
 ### 3c. Build
 
-**First, verify the local Maven is compatible with the app's current plugin.** The baseline builds on the app's **current** `mule-maven-plugin`, which for Mule 4.3/4.4 apps is on the 3.x line. The 3.x plugin was built against Maven 3.8's Eclipse Aether; Maven 3.9 replaced it with Maven Resolver, so a 3.x plugin crashes on Maven ≥ 3.9 with a cryptic `NoClassDefFoundError: org/eclipse/aether/connector/basic/BasicRepositoryConnectorFactory` at packaging time. Catch that here, before the build, with an actionable message — the same "fail immediately, not seven steps later" philosophy as the Java gate:
+**First, make the baseline buildable on a modern Maven.** The baseline builds on the app's **current** `mule-maven-plugin` (MMP), which for Mule 4.3/4.4 apps is on the 3.x line. MMP 3.x was built against Maven 3.8's Eclipse Aether; Maven 3.9 replaced it with Maven Resolver, so a 3.x plugin crashes on Maven 3.9.x with a cryptic `NoClassDefFoundError: org/eclipse/aether/connector/basic/BasicRepositoryConnectorFactory` at packaging time. The toolchain requires **Maven 3.9.x** (already gated in Step 1 — MMP 4.x and MUnit need it); we do **not** ask users to downgrade to EOL Maven 3.8. Instead, if the current MMP can't run on 3.9.x, bump it to the latest 4.x **for the baseline build only**.
+
+**Determine whether the current MMP needs a bump for the baseline:**
 
 ```bash
-node scripts/check_maven_compat.mjs .
+node scripts/detect_current_mmp_version.mjs .
 ```
 
-Read `tmp/maven-compat.json` and branch:
+Read `tmp/current-mmp.json`. If `needsPluginBump: false` (current MMP is already **4.x**) → go straight to the build. If `needsPluginBump: true` (current MMP is **3.x** and would crash on Maven 3.9.x) → establish the baseline on the latest 4.x MMP.
 
-- **exit 0 (`compatible: true`)** → local Maven is fine (or the plugin version couldn't be resolved locally, in which case it's a `warnings[]` pass, not a block). Proceed to the build.
-- **exit 1 (`errors[]` non-empty)** → STOP. Surface `errors[0]` verbatim — it names the current plugin version, the local Maven version, and the fix (build this baseline with Maven 3.8.x, e.g. put a 3.8.x `bin/` first on `PATH` for this session). Do not attempt the `mvn` build until Maven reports 3.8.x. This is a toolchain mismatch on the developer machine, **not** an app defect.
+**Resolve the latest MMP live from Maven metadata** (`<release>` element — authoritative "latest published"; never hardcode a version). Cache it to `tmp/latest-mmp.txt` so Step 11a reuses this value instead of re-fetching the same metadata:
 
-Then run the baseline build with the resolved `JAVA_HOME` (one `mvn` invocation, nothing else in the response):
+```bash
+MMP=$(curl -s "https://repository.mulesoft.org/nexus/content/repositories/releases/org/mule/tools/maven/mule-maven-plugin/maven-metadata.xml" \
+  | grep -oE '<release>[^<]+</release>' | sed -E 's/<\/?release>//g')
+echo "$MMP" > tmp/latest-mmp.txt
+echo "latest MMP: $MMP"   # this is <latest-4.x> below
+```
+
+Then apply it for the baseline build only. Two cases, by how the pom pins the plugin version:
+
+- **Case A — version is a property** (e.g. `<version>${mule.maven.plugin.version}</version>`): override on the command line, **no file change**:
+  ```bash
+  JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) \
+    mvn clean package -Dmule.maven.plugin.version="$MMP"
+  ```
+- **Case B — version is a literal** (e.g. `<version>3.5.4</version>`): a `-D` flag cannot override a hardcoded plugin version, so the pom must be edited. **Do not hand-edit with `Edit`/`sed`** — tab-indented poms and multiple `mule-maven-plugin` blocks (build/plugins + pluginManagement) make that error-prone. Use the deterministic writer, which rewrites only the `<version>` inside the matched plugin block(s), whitespace-agnostic:
+  ```bash
+  cp pom.xml tmp/pom.baseline.bak
+  node scripts/set_plugin_version.mjs mule-maven-plugin "$MMP" . --group-id org.mule.tools.maven
+  JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
+  cp tmp/pom.baseline.bak pom.xml   # ALWAYS revert — on success AND failure. The real bump happens in Phase 2 after approval.
+  ```
+  Log clearly: *"current MMP <old> can't run on Maven 3.9.x; building baseline on $MMP (not persisted — reverted after build)."*
+
+For a 4.x MMP with no bump needed, just run the build with the resolved `JAVA_HOME` (one `mvn` invocation, nothing else in the response):
 
 ```bash
 JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
 ```
 
-- **`BUILD SUCCESS`** → baseline established. Continue to Step 4.
-- **Build fails** → STOP. Inform the user the app must build cleanly on its current versions before an upgrade can proceed, and surface the failure. Do not attempt upgrade edits to fix a pre-existing baseline failure.
+Branch on the result:
+
+- **`BUILD SUCCESS`** → baseline established (Case B: confirm the pom was reverted). Continue to Step 4.
+- **Build fails** → STOP. In Case B, **revert the pom first**, then surface the failure. Inform the user the app must build cleanly on its current versions (with a compatible toolchain) before an upgrade can proceed. Do not attempt upgrade edits to fix a pre-existing baseline failure.
 
 ---
 
@@ -461,8 +489,10 @@ For every connector in `tmp/target-connectors.json`, write one file keyed by its
 
 ```json
 {
-  "mule":       { "from": "<current>", "to": "<locked target>" },
-  "java":       { "from": "<current>", "to": "<locked target>" },
+  "mule":            { "from": "<current>", "to": "<locked target>" },
+  "java":            { "from": "<current>", "to": "<locked target>" },
+  "muleMavenPlugin": { "to": "<latest MMP from Step 11a>" },
+  "munit":           { "to": "<latest MUnit from Step 11a>" },
   "connectors": [
     { "nick": "s3", "groupId": "com.mulesoft.connectors", "artifactId": "mule-amazon-s3-connector", "from": "5.8.4" }
   ]
@@ -474,6 +504,8 @@ Fill each field from a source you already produced — **never hardcode a versio
 - **`mule.from`** ← `jq -r '.version' tmp/current-mule-version.json` (Step 2a), or the value the user supplied/corrected in Step 3a.
 - **`java.from`** ← `jq -r '.version' tmp/current-java-version.json` (Step 2b), or the Step-3a corrected value.
 - **`mule.to` / `java.to`** ← the **locked target from Step 4c**. Read it from `tmp/target-versions.json`: recommendation accepted → `.options[0].mule` / `.options[0].java`; user-requested target validated and confirmed → `.requestedTarget.mule` / `.requestedTarget.java`. Use exactly the pair the user confirmed — do not re-derive.
+- **`muleMavenPlugin.to`** ← the **latest MMP resolved live in Step 11a** from Maven metadata. Not known yet at this step — Step 11a writes it back into this file before Step 14. `apply_runtime_bump.mjs` reads it to bump `<mule.maven.plugin.version>`; if absent it leaves the property untouched.
+- **`munit.to`** ← the **latest MUnit resolved live in Step 11a** from Maven metadata. Not known yet at this step — Step 11a writes it back into this file before Step 14. `apply_runtime_bump.mjs` reads it to bump every MUnit version site (property + plugin + `munit-runner`/`munit-tools` dependencies); if absent it leaves them untouched.
 - **`connectors[]`** ← one entry per connector in `tmp/target-connectors.json`: `nick` remapped to the XSD prefix (used) or slug (pom-only), `groupId`/`artifactId` verbatim, `from` ← its `currentVersion`.
 
 After writing, sanity-check: `jq -e '.mule.to and .java.to and (.connectors|type=="array")' tmp/upgrade-targets.json`. Every downstream step reads `mule.to`/`java.to` and iterates `.connectors[]` — if either target is null or `connectors` is missing, fix it here before proceeding to Step 7.
@@ -752,10 +784,63 @@ This step is **discovery only** — grep/read the tests and flag every mismatch,
 
 ## Step 11: Get Plugin Versions
 
-(To be implemented)
+Resolve the target **Mule Maven Plugin (MMP)** and **MUnit** versions the upgraded app should adopt. Both follow the same two-part model: the **version** is resolved live (deterministic, never hardcoded); the **compatibility envelope** for that version is read from release notes.
 
-- Get latest Mule Maven plugin version
-- Get latest MUnit plugin version
+### 11a — Resolve the latest version (live, deterministic)
+
+Both plugins publish every release to Maven metadata, so the newest version is a deterministic lookup — take the `<release>` element (authoritative "latest published"; more reliable than `<latest>`, which can point at a snapshot/RC):
+
+- **MMP** — `https://repository.mulesoft.org/nexus/content/repositories/releases/org/mule/tools/maven/mule-maven-plugin/maven-metadata.xml`
+- **MUnit** — `https://repository.mulesoft.org/nexus/content/repositories/releases/com/mulesoft/munit/tools/munit-maven-plugin/maven-metadata.xml`
+
+```bash
+curl -s "<metadata-url>" | grep -oE '<release>[^<]+</release>' | sed -E 's/<\/?release>//g'
+```
+
+Keeping projects on the **latest** MMP/MUnit is the recommended strategy.
+
+**Write both resolved versions back into `tmp/upgrade-targets.json`.** Step 14's `apply_runtime_bump.mjs` reads `.muleMavenPlugin.to` to bump `<mule.maven.plugin.version>` and `.munit.to` to bump every MUnit version site (the `<munit.version>` property, the `munit-maven-plugin` plugin block, and the `munit-runner` / `munit-tools` dependencies) — set them here so the bumps use the live latest, never a hardcoded pin. **Reuse the MMP value Step 3c already resolved** (`tmp/latest-mmp.txt`) when present — Step 3c only fetches for 3.x apps, so fall back to a fresh fetch when the cache is absent (the app was already on 4.x MMP):
+
+```bash
+MMP=$(cat tmp/latest-mmp.txt 2>/dev/null)
+[ -z "$MMP" ] && MMP=$(curl -s "https://repository.mulesoft.org/nexus/content/repositories/releases/org/mule/tools/maven/mule-maven-plugin/maven-metadata.xml" | grep -oE '<release>[^<]+</release>' | sed -E 's/<\/?release>//g')
+MUNIT=$(curl -s "https://repository.mulesoft.org/nexus/content/repositories/releases/com/mulesoft/munit/tools/munit-maven-plugin/maven-metadata.xml" | grep -oE '<release>[^<]+</release>' | sed -E 's/<\/?release>//g')
+tmp=$(mktemp); jq --arg m "$MMP" --arg u "$MUNIT" '.muleMavenPlugin = {to: $m} | .munit = {to: $u}' tmp/upgrade-targets.json > "$tmp" && mv "$tmp" tmp/upgrade-targets.json
+```
+
+### 11b — Determine that version's Java / Maven / Mule compatibility
+
+<!--
+  KNOWN LIMITATION — no machine-readable compatibility source (verified 2026-08).
+  Maven metadata gives us the VERSION but carries NO Java / Maven / Mule-runtime
+  compatibility. We also checked the plugin POM
+  (.../mule-artifact-tools/<v>/mule-artifact-tools-<v>.pom): it only exposes the
+  COMPILE target (java.source/target = 1.8) and CI-only <jdk> build profiles, and
+  has NO requireMavenVersion/requireJavaVersion enforcer rule — so it encodes the
+  compile floor, NOT the supported envelope. The only authoritative source for
+  "which Java/Maven/Mule a given MMP/MUnit version supports" is the release notes.
+
+  Open item: confirm whether any machine-readable compat source exists
+  (API / metadata field / artifact manifest). Until then we read release notes.
+
+  TODO(deterministic-compat): once/if a machine-readable compat source is confirmed,
+  replace the release-notes read below with a deterministic scripted resolver
+  (tmp/plugin-compat.json) so compat is not parsed from prose at runtime.
+-->
+
+Because there is **no API for it today**, the agent reads compatibility from the release-notes pages. These are stable, human-navigable, and self-linking — **do not construct version-specific URLs**; the index page lists every version as a hyperlink, so follow the link it gives you:
+
+- **MUnit index:** `https://docs.mulesoft.com/release-notes/munit/munit-release-notes` — lists each `MUnit <x.y.z> Release Notes` link (and marks deprecated ones). Follow the link for the version resolved in 11a; **skip any entry tagged "Deprecated."**
+- Read that version's page for: supported **OpenJDK** versions, supported **Maven** range, supported **Mule runtime** range.
+
+**Shape-sanity guard (the extraction is prose-read, so validate it).** After reading, confirm the extracted values are well-formed before trusting them: Java list is a non-empty subset of the known set (`8, 11, 17, 21, …`); Maven value is a valid range; Mule value is a valid version constraint. If the read comes back **empty or malformed**, do **not** guess or proceed — stop and surface it for the user to confirm.
+
+**Reference values (verified against MUnit 3.7.3 / MMP 4.10.1 release notes, 2026-08 — re-verify per resolved version):**
+
+- MUnit 3.7.3 → OpenJDK **8, 11, 17, 21** · Maven **3.9.0–3.9.15** · Mule runtime **≥ 4.3**
+- MMP 4.10.1 → OpenJDK **8, 11, 17, 21** · Maven **3.9.0–3.9.15**
+
+Confirm the target Java (from Step 2b) and target Mule (from Step 6) fall inside the resolved envelope. Record the resolved versions + compat for use by Step 12 (plan) and the Maven pre-req range check.
 
 ---
 
@@ -817,11 +902,29 @@ Write `tmp/upgrade-plan.md` with the rename bullets from 12.2 folded in. Plan **
 ## Targets
 - Mule runtime: <from> → <to>
 - Java: <from> → <to>
-- Connectors:
-  - <nick>: <old-gav> → <new-gav>   [Java window verdict: ok | warn | block-handled]
-    - Current version Java support: [<supportedJava…>]   (source: connector-java-compat.json .connectors[].supportedJava)
-    - Target version Java support:  [<supportedJava…>]   (source: target-connectors.json .connectors[].supportedJava)
-    - Show this line for **every** connector so the user sees when a current version is off the target Java (e.g. current supports [8] only, target Java 17) and why the bump is needed. If the current version already supports the target Java, say so (no functional break, version-only bump).
+
+### Connectors
+
+**Connectors (<N>)** — recommended to move to the **latest version supporting Java <targetJava> + Mule <targetMule>**.
+
+| Connector | Current version and Java compatibility | Updated version | Notes |
+|---|---|---|---|
+| <name> | <currentVersion> — Java <supportedJava…> | <targetVersion> | <note> |
+
+Render this as a single table — one row per connector. **Sort rows so any with a non-`—` Note float to the top.** Column sources (all already on disk — cite, never invent):
+
+- **Connector** — the human-readable connector name (not the internal `<nick>`).
+- **Current version and Java compatibility** — `<currentVersion>` + its Java window from `connector-java-compat.json .connectors[].supportedJava` (Step 5b). Keep the version and its Java window in this one column — the Java window is an attribute of that version. Bold `Java 8 only` when `supportedJava == [8]` (no fallback).
+- **Updated version** — `targetVersion` from `target-connectors.json` (Step 6): the latest version supporting **both** the target Java and target Mule. When `changed: false` (current already IS the latest compatible), show the same version and set the Note to `already latest compatible — no change`.
+- **Notes** — derived deterministically from data already on disk; **never** free-text impression. Empty → `—`. Compose from:
+  - MAJOR bump — `major(targetVersion) != major(currentVersion)` (semver on `target-connectors.json`).
+  - prefix `<from>` → `<to>` — `usage.namespace_prefix_changed` (Step 7b).
+  - operation / config / error-type change — the connector has ≥1 rewrite bullet in the §Operations / §Configs / §error-type sections below (Step 7 diffs).
+  - `current is Java 8 only` — `supportedJava == [8]`.
+  - `custom — verify manually` — connector was unverifiable on Exchange (custom/private).
+  - `already latest compatible — no change` — `changed: false`.
+
+**Do NOT repeat the target-Java window per row** (it is constant — every Updated version supports the target by construction; the header states this once). **A `—` Note is only trustworthy after the Step 11.5 coverage gate passed** — it means Step 7's diffs came back empty, not that analysis was skipped.
 
 ## Namespace prefix changes
 - <nick>: <old-prefix> → <new-prefix>   (source: usage.namespace_prefix_changed)
@@ -874,11 +977,14 @@ For every DW consumer that reads output from an op the plan will rewrite:
 ## pom.xml
 - <app.runtime>: <from> → <to> (inserted if absent)
 - <javaVersion> / maven.compiler.{source,target,release} / java.version / jdk.version: <from> → <to> (each bumped only if present)
-- <mule.maven.plugin.version>: bumped per references/runtime-bump-matrix.md
+- <mule.maven.plugin.version>: bumped to the latest MMP (`.muleMavenPlugin.to`, resolved live in Step 11a)
 
 ## mule-artifact.json
-- minMuleVersion: <from> → <to>
+- minMuleVersion: <from> → <to-feature-line> (truncated to `x.y.0` — e.g. `4.9.19` → `4.9.0`; declares the app's required features by the MINOR line, matching ACB/Studio and the Introspection Service. The test-runtime hazard this creates is neutralized by the `<runtimeVersion>${app.runtime}</runtimeVersion>` pin in the munit config)
 - javaSpecificationVersions: ensure it contains <to> (array inserted if absent, for any target Java)
+
+## pom.xml — munit-maven-plugin
+- <runtimeVersion>: inserted as `${app.runtime}` into the munit config if absent (never clobbers an existing pin) — forces MUnit's embedded test runtime to the full target patch instead of falling back to the `x.y.0` minMuleVersion floor, which would boot an older runtime and fail JAVA_25-annotated connectors with `EnumConstantNotPresentException`
 
 ## xsi:schemaLocation URLs
 - apply_connector_pin.mjs will rewrite mule-<connector>.xsd URLs deterministically
@@ -969,8 +1075,10 @@ The fixed order above (promote drafts → runtime bump → per-connector pin) **
 
 - **`<app.runtime>`** — always ensured: bumped if present, else **inserted** into `<properties>` (an app that never declared it still gets pinned to the target runtime).
 - **Java version properties** — `<javaVersion>`, `maven.compiler.{source,target}`, `maven.compiler.release`, `java.version`, `jdk.version` are each bumped **only if already present** (never inserted — a POM that doesn't declare a tag shouldn't sprout it).
-- **`<mule.maven.plugin.version>`** — bumped if present, else inserted, per `references/runtime-bump-matrix.md`.
-- **`mule-artifact.json`** — `minMuleVersion` set to the target, and `javaSpecificationVersions` always ensured to contain the target Java (the array is **inserted if absent**).
+- **`<mule.maven.plugin.version>`** — bumped if present, else inserted, to `.muleMavenPlugin.to` (the latest MMP resolved live in Step 11a). If that field is absent from `tmp/upgrade-targets.json`, the property is left unchanged.
+- **MUnit versions** — all three sites bumped to `.munit.to` (the latest MUnit resolved live in Step 11a): the `<munit.version>` property (if declared), the `munit-maven-plugin` plugin block, and the `munit-runner` / `munit-tools` dependency blocks. `${property}`-driven versions ride the property bump; hardcoded literals are rewritten in place. **Do not hand-edit MUnit versions** — this script owns them, same as the connector pins and MMP. If `.munit.to` is absent, the sites are left unchanged.
+- **`munit-maven-plugin` `<runtimeVersion>`** — inserted as `${app.runtime}` into the plugin's `<configuration>` (a `<configuration>` block is created if the plugin has none). **Insert-if-absent**: an existing `<runtimeVersion>` (a team's deliberate pin) is never overwritten. This pins MUnit's embedded test runtime to the full target patch. Without it, MUnit falls back to `minMuleVersion` — which we (correctly) write as the `x.y.0` feature line — and would boot the older `x.y.0` runtime, whose `mule-sdk-api` `JavaVersion` enum can lack newer constants (e.g. `JAVA_25`); connectors compiled against the target patch's `@SupportedJavaVersions` then fail extension-model parsing at deploy with `EnumConstantNotPresentException` and MUnit never runs.
+- **`mule-artifact.json`** — `minMuleVersion` set to the **`x.y.0` feature line** (e.g. target `4.9.19` → `minMuleVersion 4.9.0`). This is the platform-correct form: `minMuleVersion` declares the *features* the app needs, scoped to the minor line — ACB and Studio write it the same way, and the Introspection Service depends on it. `<app.runtime>` keeps the full patch version. The test-runtime hazard the floor would otherwise create is neutralized by the `<runtimeVersion>${app.runtime}</runtimeVersion>` pin above. `javaSpecificationVersions` always ensured to contain the target Java (the array is **inserted if absent**).
 
 - Update mule-artifact.json (minMuleVersion, javaSpecificationVersions)
 - Update pom.xml (runtime version, Java version, connector versions, plugin versions)
@@ -1030,6 +1138,8 @@ Connector-specific hot spots to sanity-check even when the plan didn't flag them
 
 ### 15.3 MUnit edits (mirror the plan's §Operations + §DataWeave downstream impact + §Connector-wide error type renames)
 
+> **MUnit *version* bumps are NOT here.** The `<munit.version>` property, `munit-maven-plugin`, and `munit-runner`/`munit-tools` dependency versions are bumped deterministically by `apply_runtime_bump.mjs` in Step 14 (from `.munit.to`). This section covers only MUnit **test-content** edits driven by connector op renames / shape changes — never hand-edit a MUnit version here.
+
 MUnit has no dedicated plan section — its edits fall out of the same op renames, output-shape changes, and error-type renames the flow edits use. For every op the plan will rewrite, review each `src/test/munit/**.xml` that references it:
 - Update `<munit-tools:mock-when>` `processor` attributes to the NEW element name (e.g. `processor="salesforce:query"`).
 - Update mocked `<munit-tools:then-return>` payload shape if Mode-B `.output*` indicates a schema change.
@@ -1083,7 +1193,7 @@ Bounded recovery loop with a **5-retry** cap. `mvn clean package -DskipTests` BU
    <skill-dir>/scripts/describe_connector.mjs "<nick>"        # no -new suffix → writes tmp/connector-metadata/<nick>.json
    ```
    Then read `<nick>.json` → `.namespace.uri`. Recovery: re-run `apply_connector_pin.mjs <nick> .` (it reads `<nick>-new.json` for the namespace and rewrites the URL deterministically). Do NOT hand-edit `xsi:schemaLocation`.
-7. **pom / plugin / runtime** — anything from the reactor before the app loads (`mule-maven-plugin` not found, `${app.runtime}` unresolved, `javaSpecificationVersions` mismatch, missing artifact in the local repo). Fix source: `references/runtime-bump-matrix.md`; `pom.xml` + `mule-artifact.json`; `tmp/connector-versions/*.json`. Recovery: re-run `apply_runtime_bump.mjs .` (runtime/plugin property wrong) or `apply_connector_pin.mjs <nick> .` (dependency version wrong). Only hand-edit `pom.xml` when both scripts report `not-found`.
+7. **pom / plugin / runtime** — anything from the reactor before the app loads (`mule-maven-plugin` not found, `${app.runtime}` unresolved, `javaSpecificationVersions` mismatch, missing artifact in the local repo). Fix source: `tmp/upgrade-targets.json` (`.muleMavenPlugin.to`, the Step 11a MMP); `pom.xml` + `mule-artifact.json`; `tmp/connector-versions/*.json`. Recovery: re-run `apply_runtime_bump.mjs .` (runtime/plugin property wrong) or `apply_connector_pin.mjs <nick> .` (dependency version wrong). Only hand-edit `pom.xml` when both scripts report `not-found`.
 8. **unknown / other** — doesn't fit the classes above. Fix source: cross-reference `tmp/connector-metadata/*.json` + `tmp/connector-versions/*.json` with Mule 4 XSD/DSL semantics. Recovery: revisit whichever earlier phase's output the failure implicates; log reasoning in `tmp/mvn-failures/<attempt>.log`. Fall through to `AskUserQuestion` only once the 5-retry budget is exhausted OR the same knowledge-based edit has already failed once.
 
 Apply **one** targeted edit per retry (one `Edit`, or the ONE script re-run named in the recovery step) — do not batch. Re-run `mvn clean package` in a NEW response. On success → Step 17; on failure → increment the retry counter and re-parse.
@@ -1262,9 +1372,9 @@ node <skill-dir>/scripts/detect_current_java_version.mjs . --user-version <n>
 # MAY download over the network; pass --no-download to only detect an installed JDK.
 node <skill-dir>/scripts/resolve_jdk.mjs <current-java-major> .
 
-# Step 3c — verify local Maven is compatible with the CURRENT plugin (writes tmp/maven-compat.json)
-# HARD-STOP (exit 1) if a 3.x mule-maven-plugin would run on Maven >= 3.9 (BasicRepositoryConnectorFactory crash).
-node <skill-dir>/scripts/check_maven_compat.mjs .
+# Step 3c — detect current MMP version (writes tmp/current-mmp.json; needsPluginBump=true when MMP is 3.x)
+# 3.x can't run on the required Maven 3.9.x → Step 3c bumps MMP to latest 4.x for the baseline build only.
+node <skill-dir>/scripts/detect_current_mmp_version.mjs .
 
 # Step 3c — baseline build on the resolved JAVA_HOME (must be BUILD SUCCESS)
 JAVA_HOME=$(jq -r .javaHome tmp/resolve-jdk-<major>.json) mvn clean package
