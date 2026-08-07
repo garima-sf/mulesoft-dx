@@ -6,7 +6,7 @@ The agent has already read `tmp/connector-metadata/<nick>-new.json` (NEW describ
 
 **Non-negotiable:** the LLM must consult the per-op JSON before writing any attribute on the operation element. Attributes not present in `per-op.attributes[]` are XSD errors; body-carrying params (`content`, `payload`, `records`, etc.) are usually in `childElements[]`, not attributes.
 
-**Connection-provider elements are described in Mode C — always use it** (see DRAWBACKS.md #17). `<prefix:config>` has no `--type operation` describe, but the CLI DOES support `--type connection-provider --name <provider> --config-name <config>` (Mode C in `scripts/describe_connector.sh`). Phase B runs Mode C once per `(config, provider)` pair the flow uses. When editing a config block:
+**Connection-provider elements are described in Mode C — always use it.** `<prefix:config>` has no `--type operation` describe, but the CLI DOES support `--type connection-provider --name <provider> --config-name <config>` (Mode C in `scripts/describe_connector.mjs`). Phase B runs Mode C once per `(config, provider)` pair the flow uses. When editing a config block:
 
 1. Read `tmp/connector-metadata/<nick>-new-<config>-<provider>.json`.
 2. Use `.elementName` at the top for the config element's local-name (e.g. `sfdc-config`, `config`, `listener-config`).
@@ -82,7 +82,7 @@ Instructions:
    - Map the OLD errorType to the closest NEW errorType by name.
 
 5. If namespace.prefix_changed, rewrite `<oldprefix:...>` → `<newprefix:...>` on the touched elements only.
-   - Do NOT touch xsi:schemaLocation — Phase D (apply_connector_pin.sh) handles it deterministically.
+   - Do NOT touch xsi:schemaLocation — Phase D (apply_connector_pin.mjs) handles it deterministically.
 
 6. If a site is (or is inside) a `<prefix:config>` block, read the Mode-C describe at `tmp/connector-metadata/<nick>-new-<config>-<provider>.json` — Phase B ran one per `(config, provider)` pair used by the flow. Use `.elementName` for the config element and `.connectionProviders[] | select(.name == "<provider>") | .elementName` for the connection element. Never guess from the SDK provider identifier.
 
@@ -104,4 +104,4 @@ Constraints:
 
 - The prompt is self-contained — it includes all the context (NEW describe, usage sites, namespace hints) so the agent doesn't need to re-open files.
 - The agent should run this prompt once per operation. Do not batch multiple operations into one prompt — each operation is independent; interleaving them dilutes context.
-- After all operations are processed, the agent proceeds to Phase D (apply_connector_pin.sh) to bump pom.xml and rewrite xsi:schemaLocation URLs deterministically.
+- After all operations are processed, the agent proceeds to Phase D (apply_connector_pin.mjs) to bump pom.xml and rewrite xsi:schemaLocation URLs deterministically.

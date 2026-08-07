@@ -121,7 +121,7 @@ if (!NEW_PREFIX) {
 }
 const NEW_URI = (ns && typeof ns === 'object') ? (ns.uri || ns.namespace || '') : '';
 
-// -- OLD-prefix fallback (DRAWBACKS.md #15) --------------------------------
+// -- OLD-prefix fallback --------------------------------
 let PREFIX = NEW_PREFIX;
 let PREFIX_CHANGED_FROM = '';
 

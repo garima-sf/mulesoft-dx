@@ -7,11 +7,13 @@
 // Part of upgrade-mule-app skill.
 //
 // Phase D.5 helper — deterministic Mule runtime + Java bumps to pom.xml
-// and mule-artifact.json. Reads tmp/upgrade-targets.json (Phase A) and
-// tmp/mule-dev-env.json (validate_prerequisites.sh output).
+// and mule-artifact.json. Reads tmp/upgrade-targets.json (Phase A).
 //
-// Exit 0 on success, 1 for missing/malformed inputs, 2 for JAVA_HOME
-// mismatch (caller surfaces the fix instruction).
+// Version rewrites only — does NOT run java. The build is pinned to the
+// ACB-resolved target JDK via the inline `JAVA_HOME=... mvn` prefix (Step 16),
+// mirroring the baseline build; there is no separate JDK guard here.
+//
+// Exit 0 on success, 1 for missing/malformed inputs.
 //
 // Usage:
 //   node scripts/apply_runtime_bump.mjs [<project-dir>]
@@ -23,13 +25,11 @@ import {
   editMuleArtifact,
   editMunitVersion,
   editMunitRuntimeVersion,
-  checkJavaHome,
 } from '../lib/pom-edit.mjs';
 
 const projectDir = argv[2] || '.';
 
 const targetsFile = env.UPGRADE_TARGETS_FILE || 'tmp/upgrade-targets.json';
-const envFile = env.MULE_DEV_ENV_FILE || 'tmp/mule-dev-env.json';
 
 if (!isFile(targetsFile)) {
   stderr.write(`❌ missing ${targetsFile} — write this in Phase A of the skill\n`);
@@ -82,8 +82,6 @@ editMunitVersion(path.join(projectDir, 'pom.xml'), targetMunit, log);
 editMunitRuntimeVersion(path.join(projectDir, 'pom.xml'), log);
 editMuleArtifact(path.join(projectDir, 'mule-artifact.json'), targetMule, targetJava, log);
 
-const javaCheck = checkJavaHome(envFile, targetJava);
-
 const summary = {
   targets: {
     mule: targetMule,
@@ -92,8 +90,7 @@ const summary = {
     munit: targetMunit,
   },
   applied: log,
-  java_home_check: javaCheck,
 };
 stdout.write(JSON.stringify(summary, null, 2) + '\n');
 
-exit(javaCheck.status === 'mismatch' ? 2 : 0);
+exit(0);

@@ -696,38 +696,3 @@ export function editFlowXsdUrls(projectDir, namespacePrefix, namespaceMetadata, 
     }
   }
 }
-
-// ---------- JAVA_HOME check ----------
-
-/**
- * @param {string} envPath Path to tmp/mule-dev-env.json.
- * @param {string} targetJava
- * @returns {{status:'ok'|'mismatch'|'unknown', current?:string, target?:string, reason?:string, instruction?:string}}
- */
-export function checkJavaHome(envPath, targetJava) {
-  if (!existsSync(envPath)) {
-    return { status: 'unknown', reason: `${envPath} not found — run validate_prerequisites.sh` };
-  }
-  let env;
-  try {
-    env = JSON.parse(_read(envPath));
-  } catch (e) {
-    return { status: 'unknown', reason: `${envPath} not parseable: ${e.message}` };
-  }
-  const current = String(env.java_version || '');
-  if (!current) {
-    return { status: 'unknown', reason: 'java_version missing from mule-dev-env.json' };
-  }
-  if (current.startsWith(`${targetJava}.`) || current === targetJava) {
-    return { status: 'ok', current, target: targetJava };
-  }
-  return {
-    status: 'mismatch',
-    current,
-    target: targetJava,
-    instruction:
-      `JAVA_HOME points to Java ${current} but the upgrade targets Java ${targetJava}. ` +
-      `Point JAVA_HOME at a Java ${targetJava} install (e.g. \`export JAVA_HOME=$(/usr/libexec/java_home -v ${targetJava})\` on macOS) ` +
-      'and rerun.',
-  };
-}

@@ -8,9 +8,8 @@
 //
 // Phase E helper — promote every `<nick>-new` draft in
 // tmp/connector-choices/ to tmp/connector-versions/<nick>.json. Strips a
-// trailing `-new` so validate_before_build.mjs's canonical
-// tmp/connector-versions/<nick>.json path is fed correctly. See
-// DRAWBACKS.md #5.
+// trailing `-new` so the canonical tmp/connector-versions/<nick>.json path
+// is fed correctly.
 //
 // Usage:
 //   node scripts/promote_new_connector_pins.mjs
@@ -26,7 +25,7 @@ const versionsDir = env.CONNECTOR_VERSIONS_DIR || 'tmp/connector-versions';
 
 if (!isDir(choicesDir)) {
   stderr.write(`❌ no drafts directory at ${choicesDir}\n`);
-  stderr.write('   run pick_connector.sh <nick>-new <gav> in Phase A.3 first\n');
+  stderr.write('   write tmp/connector-choices/<nick>-new.json (Step 6.5) first\n');
   exit(1);
 }
 
@@ -43,7 +42,7 @@ try {
 
 if (newDrafts.length === 0) {
   stderr.write(`❌ no *-new.json drafts in ${choicesDir}\n`);
-  stderr.write('   run pick_connector.sh <nick>-new <gav> in Phase A.3 first\n');
+  stderr.write('   write tmp/connector-choices/<nick>-new.json (Step 6.5) first\n');
   exit(1);
 }
 

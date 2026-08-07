@@ -124,7 +124,7 @@ const NEW_URI = (ns && typeof ns === 'object')
   ? (ns.uri || ns.namespace || '')
   : '';
 
-// -- OLD-prefix fallback (DRAWBACKS.md #15) --------------------------------
+// -- OLD-prefix fallback --------------------------------
 
 let PREFIX = NEW_PREFIX;
 let PREFIX_CHANGED_FROM = '';
@@ -142,8 +142,7 @@ if (env.PREFIX_OVERRIDE) {
 
 // Automatic fallback: if NEW prefix has zero flow hits, walk every prefix
 // bound to the NEW namespace URI and pick the first that appears as an
-// element opener. DRAWBACKS.md #18 (previous bash regression) — this must
-// tolerate zero hits without exiting.
+// element opener. This must tolerate zero hits without exiting.
 if (!PREFIX_CHANGED_FROM && countPrefixOpeners(FLOW_FILES, NEW_PREFIX) === 0 && NEW_URI) {
   const candidates = scanFlowPrefixesForUri(FLOW_FILES, NEW_URI);
   for (const cand of candidates) {
@@ -212,7 +211,7 @@ for (const name of ELEMS) {
     config_elems_used.push(name);
   } else if (cfgProvidersSet.has(name)) {
     // Known child element of <prefix:config> — bucket into
-    // child_elements_used only (DRAWBACKS.md POC-remaining #5).
+    // child_elements_used only.
     provider_hits_from_classify.push(name);
     child_elements_used.push(name);
   } else {
