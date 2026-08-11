@@ -15,7 +15,3 @@ docs/superpowers/
 
 # Runtime scratch dirs written by skill helper scripts. Never commit.
 skills/**/tmp/
-skills/**/scripts/tmp/
-
-# Local-only archive of the pre-rewrite bash/python skill scripts. Kept on disk, untracked.
-skills/mule-development/upgrade-mule-app/scripts/archive/

@@ -18,7 +18,7 @@
 //   C — Per-config connection provider
 //       (--type connection-provider --name <provider> --config-name <config>)
 //
-// Mode C is the fix for DRAWBACKS.md #17 — the connection-provider DSL
+// Mode C exists because the connection-provider DSL
 // `elementName` isn't in Mode-A output. Mode C's response carries it, so
 // Phase C can write the right `<prefix:config>` child element.
 //
@@ -178,7 +178,7 @@ if (existsSync(draftPath)) {
   GAV_JSON = commitPath;
 } else {
   stderr.write(`❌ No GAV file for '${NICKNAME}' in ${CHOICES_DIR}/ or ${VERSIONS_DIR}/\n`);
-  stderr.write(`   Run get_latest_connector.sh ${NICKNAME}, then pick_connector.sh ${NICKNAME} <gav>\n`);
+  stderr.write(`   Resolve the target version (resolve_target_connectors.mjs) and write tmp/connector-choices/${NICKNAME}-new.json first\n`);
   exit(1);
 }
 
