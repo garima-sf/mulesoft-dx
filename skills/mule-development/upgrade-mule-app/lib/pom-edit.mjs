@@ -188,7 +188,7 @@ export function editMuleArtifact(artifactPath, targetMule, targetJava, log) {
   // boot the 4.9.0 runtime whose mule-sdk-api enum lacks newer JavaVersion
   // constants (e.g. JAVA_25) and fail connector extension-model parsing; that is
   // handled separately by pinning <runtimeVersion>${app.runtime}</runtimeVersion>
-  // in the munit-maven-plugin config (see editMunitVersion).
+  // in the munit-maven-plugin config (see editMunitRuntimeVersion).
   const minMule = _featureLineVersion(targetMule);
   if (artifact.minMuleVersion !== minMule) {
     artifact.minMuleVersion = minMule;
@@ -447,8 +447,9 @@ function _setDependencyVersionInText(text, target) {
  *   - the `munit-runner` / `munit-tools` `<dependency>` blocks' literal versions.
  * Every writer skips `${property}` versions (those already ride the property
  * bumped above), so a property-driven pom is a single clean edit and a
- * literal-driven pom rewrites each element. All artifacts are under groupId
- * `com.mulesoft.munit`.
+ * literal-driven pom rewrites each element. Per the MUnit-in-Maven docs the
+ * groupIds differ: the `munit-maven-plugin` is `com.mulesoft.munit.tools`, while
+ * the `munit-runner` / `munit-tools` dependencies are `com.mulesoft.munit`.
  *
  * @param {string} pomPath
  * @param {string|null} version Latest MUnit resolved live (Step 11a), or null/empty to skip.
@@ -466,7 +467,8 @@ export function editMunitVersion(pomPath, version, log) {
   let text = _read(pomPath);
   const original = text;
   const changes = [];
-  const GROUP = 'com.mulesoft.munit';
+  const PLUGIN_GROUP = 'com.mulesoft.munit.tools'; // munit-maven-plugin
+  const DEP_GROUP = 'com.mulesoft.munit';          // munit-runner / munit-tools
 
   const prop = replaceElement(text, 'munit.version', version);
   if (prop.changed) {
@@ -474,14 +476,14 @@ export function editMunitVersion(pomPath, version, log) {
     changes.push(`munit.version=${version}`);
   }
 
-  const plug = _setPluginVersionInText(text, { groupId: GROUP, artifactId: 'munit-maven-plugin', version });
+  const plug = _setPluginVersionInText(text, { groupId: PLUGIN_GROUP, artifactId: 'munit-maven-plugin', version });
   if (plug.changed) {
     text = plug.text;
     changes.push(`munit-maven-plugin <version>=${version} (literal)`);
   }
 
   for (const artifactId of ['munit-runner', 'munit-tools']) {
-    const dep = _setDependencyVersionInText(text, { groupId: GROUP, artifactId, version });
+    const dep = _setDependencyVersionInText(text, { groupId: DEP_GROUP, artifactId, version });
     if (dep.changed) {
       text = dep.text;
       changes.push(`${artifactId} <version>=${version} (literal)`);

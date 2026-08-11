@@ -65,7 +65,7 @@ This skill ships small Node.js (ESM, zero-dep) scripts under `scripts/`. Invoke 
 | `scripts/detect_current_mule_version.mjs` | Step 2a — determine the current Mule Runtime version from the `app.runtime` property, searching the child `pom.xml` then its full local parent chain (parent, grandparent, …) with `${...}` resolved against the merged chain, and flag versions below the supported floor (4.3). `--user-version <v>` persists a user-supplied/corrected value (also flagged via `belowFloor`) | `tmp/current-mule-version.json` (contains `version`, `source`, `resolvedFrom` (`"child"` \| `"parent"` \| `"ancestor"`), `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
 | `scripts/detect_current_java_version.mjs` | Step 2b — determine the current Java version from `mule-artifact.json` `javaSpecificationVersions`, and flag versions below the supported floor (8). `--user-version <n>` persists a user-supplied/corrected value (also flagged via `belowFloor`) | `tmp/current-java-version.json` (contains `version`, `source`, `supportedVersions`, `needsUserPrompt`, `belowFloor`, `minSupportedVersion`, `warnings[]`, ...) |
 | `scripts/resolve_jdk.mjs` | Step 3 & Phase 2 — ensure a JDK for a given Java **major** is available and report a usable `JAVA_HOME`. Resolves major → full build string (e.g. `8` → `8.0.472_8`) via `dx mule runtime list` (matrix-file fallback), reuses an already-installed JDK under the Anypoint Code Builder java dir, and downloads only when none is present. MAY download (network) unless `--no-download` | `tmp/resolve-jdk-<major>.json` (contains `major`, `requestedBuild`, `javaHome`, `javaBin`, `source`, `downloaded`, `available`, `errors[]`, ...) |
-| `scripts/detect_current_mmp_version.mjs` | Step 3c (pre-build) — detect the app's **current** `mule-maven-plugin` version (read from the child `pom.xml` then its local parent chain, `${...}` resolved) so Step 3c knows whether to bump MMP for the baseline. Sets `needsPluginBump: true` when the current MMP is < 4.x (3.x can't run on the required Maven 3.9.x → bump to latest 4.x for the baseline build only). Does **not** assert Maven compatibility (that moved to the Step 1 Maven-3.9.x pre-req) and never emits a "use Maven 3.8" fix. Validation-ONLY; no download, no mutation | `tmp/current-mmp.json` (contains `pluginVersion`, `pluginMajor`, `pluginDefinedIn`, `needsPluginBump`, `errors[]`, `warnings[]`, ...) |
+| `scripts/detect_current_mmp_version.mjs` | Step 3c (pre-build) — detect the app's **current** `mule-maven-plugin` version (read from the child `pom.xml` then its local parent chain, `${...}` resolved) so Step 3c knows whether to bump MMP for the baseline. Sets `needsPluginBump: true` when the current MMP is < 4.x (3.x can't run on the required Maven 3.9.x → bump to latest 4.x for the baseline build only). Detects the MMP version only; Maven compatibility is owned by the Step 1 Maven-3.9.x pre-req. Validation-ONLY; no download, no mutation | `tmp/current-mmp.json` (contains `pluginVersion`, `pluginMajor`, `pluginDefinedIn`, `needsPluginBump`, `errors[]`, `warnings[]`, ...) |
 | `scripts/set_plugin_version.mjs` | Step 3c **Case B** (literal MMP) — deterministically set a plugin's hardcoded `<version>` in `pom.xml` when `-D` can't override it. Matches the plugin block by `artifactId` (+ `groupId` when declared) and rewrites only that block's `<version>`, whitespace/tab-agnostic; leaves `${property}` versions untouched (that's the `-D` Case-A path) and safely handles POMs with multiple plugin blocks (build/plugins + pluginManagement). Callers revert the pom after the throwaway baseline build. Exit 0 on edit/no-op, 1 on not-found/error | stdout JSON `{artifactId, version, groupId, edits[]}` (mutates `pom.xml`) |
 | `scripts/resolve_runtime.mjs` | Step 13 — ensure the **target** Mule Runtime distribution is present and report its `runtimePath`. Reuses an installed `mule-enterprise-standalone-<version>` under the Anypoint Code Builder runtime dir, else downloads it via `dx mule runtime download` — only if `dx mule runtime list` offers that version. MAY download (network) unless `--no-download`. Never sets a runtime path | `tmp/resolve-runtime-<version>.json` (contains `version`, `resolvedVersion`, `runtimePath`, `source`, `downloaded`, `available`, `errors[]`, ...) |
 | `scripts/resolve_target_versions.mjs` | Step 4 — determine the recommended upgrade target (in-channel: highest minor, latest patch, latest non-EOL Java) from the current versions + live `dx mule runtime list`, and validate a user-requested target (`TARGET_MULE`/`TARGET_JAVA`) against the locked policy. Advisory — always exits 0; caller branches on fields | `tmp/target-versions.json` (contains `currentMule`, `currentJava`, `channel`, `options[]`, `requestedTarget` {`accepted`, `mule`, `java`, `reasonCode`, `reason`, `crossChannel`, `warning`, `belowRecommended`, `note`}, `requestedJavaOnly` {`java`, `supported`, `supportedJavas[]`, `recommendedMule`, `recommendedJava`, `note`}, `nothingToUpgrade`, `needsUserPrompt`, `warnings[]`, ...) |
@@ -230,7 +230,7 @@ This is the same helper Phase 2 uses for the target Java — run it once per Jav
 
 ### 3c. Build
 
-**First, make the baseline buildable on a modern Maven.** The baseline builds on the app's **current** `mule-maven-plugin` (MMP), which for Mule 4.3/4.4 apps is on the 3.x line. MMP 3.x was built against Maven 3.8's Eclipse Aether; Maven 3.9 replaced it with Maven Resolver, so a 3.x plugin crashes on Maven 3.9.x with a cryptic `NoClassDefFoundError: org/eclipse/aether/connector/basic/BasicRepositoryConnectorFactory` at packaging time. The toolchain requires **Maven 3.9.x** (already gated in Step 1 — MMP 4.x and MUnit need it); we do **not** ask users to downgrade to EOL Maven 3.8. Instead, if the current MMP can't run on 3.9.x, bump it to the latest 4.x **for the baseline build only**.
+**First, make the baseline buildable on a modern Maven.** The baseline builds on the app's **current** `mule-maven-plugin` (MMP) — whatever version the app declares (detected below, not assumed). MMP 3.x was built against Maven 3.8's Eclipse Aether; Maven 3.9 replaced it with Maven Resolver, so a 3.x plugin crashes on Maven 3.9.x with a cryptic `NoClassDefFoundError: org/eclipse/aether/connector/basic/BasicRepositoryConnectorFactory` at packaging time. The toolchain requires **Maven 3.9.x** (already gated in Step 1 — MMP 4.x and MUnit need it); we do **not** ask users to downgrade to EOL Maven 3.8. Instead, if the current MMP can't run on 3.9.x, bump it to the latest 4.x **for the baseline build only**.
 
 **Determine whether the current MMP needs a bump for the baseline:**
 
@@ -811,21 +811,9 @@ tmp=$(mktemp); jq --arg m "$MMP" --arg u "$MUNIT" '.muleMavenPlugin = {to: $m} |
 ### 11b — Determine that version's Java / Maven / Mule compatibility
 
 <!--
-  KNOWN LIMITATION — no machine-readable compatibility source (verified 2026-08).
-  Maven metadata gives us the VERSION but carries NO Java / Maven / Mule-runtime
-  compatibility. We also checked the plugin POM
-  (.../mule-artifact-tools/<v>/mule-artifact-tools-<v>.pom): it only exposes the
-  COMPILE target (java.source/target = 1.8) and CI-only <jdk> build profiles, and
-  has NO requireMavenVersion/requireJavaVersion enforcer rule — so it encodes the
-  compile floor, NOT the supported envelope. The only authoritative source for
-  "which Java/Maven/Mule a given MMP/MUnit version supports" is the release notes.
-
-  Open item: confirm whether any machine-readable compat source exists
-  (API / metadata field / artifact manifest). Until then we read release notes.
-
-  TODO(deterministic-compat): once/if a machine-readable compat source is confirmed,
-  replace the release-notes read below with a deterministic scripted resolver
-  (tmp/plugin-compat.json) so compat is not parsed from prose at runtime.
+  KNOWN LIMITATION — no API / machine-readable compat source (verified 2026-08). Maven
+  metadata and the plugin POM give the version + compile floor only, not the
+  supported Java/Maven/Mule envelope. Release notes are the only authoritative source.
 -->
 
 Because there is **no API for it today**, the agent reads compatibility from the release-notes pages. These are stable, human-navigable, and self-linking — **do not construct version-specific URLs**; the index page lists every version as a hyperlink, so follow the link it gives you:
@@ -984,6 +972,7 @@ For every DW consumer that reads output from an op the plan will rewrite:
 - javaSpecificationVersions: ensure it contains <to> (array inserted if absent, for any target Java)
 
 ## pom.xml — munit-maven-plugin
+- MUnit versions: `<munit.version>` property / `munit-maven-plugin` plugin / `munit-runner` / `munit-tools` bumped to the latest MUnit (`.munit.to`, resolved live in Step 11a)
 - <runtimeVersion>: inserted as `${app.runtime}` into the munit config if absent (never clobbers an existing pin) — forces MUnit's embedded test runtime to the full target patch instead of falling back to the `x.y.0` minMuleVersion floor, which would boot an older runtime and fail JAVA_25-annotated connectors with `EnumConstantNotPresentException`
 
 ## xsi:schemaLocation URLs

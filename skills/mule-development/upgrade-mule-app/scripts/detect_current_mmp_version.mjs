@@ -19,8 +19,6 @@
 // current MMP version + major so Step 3c knows whether a bump is needed:
 //   pluginMajor < 4  → 3.x, bump to latest 4.x for the baseline (see Step 3c)
 //   pluginMajor >= 4 → already 4.x, build as-is
-// It no longer asserts Maven-vs-plugin compatibility (that moved to the Step 1
-// Maven-range pre-req) and never emits a "use Maven 3.8" fix.
 //
 // Usage:
 //   node detect_current_mmp_version.mjs [projectDir]
@@ -31,10 +29,6 @@
 //   needsPluginBump, errors[], warnings[], notes[] }.
 //   Exit code: 1 only when a hard error occurs (no pom.xml). Plugin-version-not-
 //   resolvable is a warning, not a block.
-//
-// NOTE: this script does NOT read the local Maven version — the Maven-3.9.x
-// pre-req is owned by Step 1 (validate_prerequisites.mjs). This is purely MMP
-// version detection.
 
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
@@ -59,6 +53,15 @@ function log(msg) {
 
 const MMP_GROUP_ID = "org.mule.tools.maven";
 const MMP_ARTIFACT_ID = "mule-maven-plugin";
+
+// Lowest MMP major that runs on the required Maven 3.9.x line. MMP 3.x was built
+// against Maven 3.8's Eclipse Aether; Maven 3.9 replaced it with Maven Resolver,
+// so MMP < 4 crashes on 3.9.x (NoClassDefFoundError: …BasicRepositoryConnectorFactory).
+// Fixed compatibility boundary, NOT a target version (latest 4.x is resolved live
+// in Step 3c). ACB ships MMP 4.10.0 and auto-bumps 3.x projects to it on first open.
+// TODO: boundary is hardcoded — make deterministic (derive from ACB/tooling
+// metadata) if it ever needs to track ACB's version precisely.
+const MMP_MIN_MAJOR_FOR_MAVEN_39 = 4;
 
 // --- helpers ---------------------------------------------------------------
 
@@ -169,7 +172,7 @@ function main() {
   // 3. Decide whether Step 3c must bump MMP for the baseline build.
   //    MMP 3.x cannot run on Maven 3.9.x (the required range) → bump to latest 4.x.
   //    MMP 4.x already runs on 3.9.x → build as-is.
-  if (result.pluginMajor !== null && result.pluginMajor < 4) {
+  if (result.pluginMajor !== null && result.pluginMajor < MMP_MIN_MAJOR_FOR_MAVEN_39) {
     result.needsPluginBump = true;
     result.notes.push(
       `Current mule-maven-plugin ${result.pluginVersion} is on the 3.x line and cannot ` +
