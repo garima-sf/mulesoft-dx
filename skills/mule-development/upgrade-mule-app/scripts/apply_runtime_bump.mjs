@@ -21,8 +21,9 @@ import { readJson, isFile } from '../lib/fsx.mjs';
 import {
   editPomRuntime,
   editMuleArtifact,
+  editMunitVersion,
+  editMunitRuntimeVersion,
   checkJavaHome,
-  muleMavenPluginFor,
 } from '../lib/pom-edit.mjs';
 
 const projectDir = argv[2] || '.';
@@ -50,8 +51,35 @@ if (!targetMule || !targetJava) {
   exit(1);
 }
 
+// Latest MMP version resolved live from Maven metadata in Step 11a and written
+// into upgrade-targets by the agent. Optional: when absent, editPomRuntime leaves
+// <mule.maven.plugin.version> untouched (and warns).
+const targetMmp = targets?.muleMavenPlugin?.to || null;
+if (!targetMmp) {
+  stderr.write(
+    `⚠️  ${targetsFile} has no muleMavenPlugin.to — resolve the latest MMP (Step 11a) and add it, ` +
+    `or <mule.maven.plugin.version> will be left unchanged.\n`
+  );
+}
+
+// Latest MUnit resolved live in Step 11a and written back by the agent. Optional:
+// when absent, editMunitVersion leaves the MUnit version sites untouched (and warns).
+const targetMunit = targets?.munit?.to || null;
+if (!targetMunit) {
+  stderr.write(
+    `⚠️  ${targetsFile} has no munit.to — resolve the latest MUnit (Step 11a) and add it, ` +
+    `or the MUnit versions (property/plugin/dependencies) will be left unchanged.\n`
+  );
+}
+
 const log = [];
-editPomRuntime(path.join(projectDir, 'pom.xml'), targetMule, targetJava, log);
+editPomRuntime(path.join(projectDir, 'pom.xml'), targetMule, targetJava, targetMmp, log);
+editMunitVersion(path.join(projectDir, 'pom.xml'), targetMunit, log);
+// Pin MUnit's embedded test runtime to <app.runtime> so it doesn't fall back to
+// the x.y.0 minMuleVersion floor (which would boot an older runtime and fail
+// JAVA_25-annotated connectors). Runs regardless of whether a MUnit version was
+// supplied, since the pin is about the runtime, not the plugin version.
+editMunitRuntimeVersion(path.join(projectDir, 'pom.xml'), log);
 editMuleArtifact(path.join(projectDir, 'mule-artifact.json'), targetMule, targetJava, log);
 
 const javaCheck = checkJavaHome(envFile, targetJava);
@@ -60,7 +88,8 @@ const summary = {
   targets: {
     mule: targetMule,
     java: targetJava,
-    mule_maven_plugin: muleMavenPluginFor(targetMule),
+    mule_maven_plugin: targetMmp,
+    munit: targetMunit,
   },
   applied: log,
   java_home_check: javaCheck,

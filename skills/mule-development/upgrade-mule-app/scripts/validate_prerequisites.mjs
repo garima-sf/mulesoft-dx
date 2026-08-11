@@ -8,7 +8,18 @@
 //
 // Step 1 helper — validate filesystem and toolchain prerequisites: app directory
 // (pom.xml + mule-artifact.json), parent-POM availability if declared, Anypoint
-// CLI v4, DX plugin. Validation-only; never prompts or mutates.
+// CLI v4, DX plugin, and local Maven in the supported range. Validation-only;
+// never prompts or mutates.
+//
+// Maven pre-req: the upgrade toolchain requires Maven 3.9.x — the line that MMP
+// 4.x and MUnit require (see SKILL.md Step 11). The baseline build (Step 3c) runs
+// on a 4.x MMP (bumping the app's current 3.x for the build only), so a 3.9.x
+// Maven is needed throughout. We gate on the 3.9 MINOR (major 3, minor 9, any
+// patch) rather than a closed patch range: MMP/MUnit release notes currently
+// validate 3.9.0–3.9.15, but patches are backward-compatible, so accepting any
+// 3.9.x avoids falsely rejecting a newer patch (e.g. 3.9.16) the moment it ships.
+// Maven is a standard developer toolchain, treated as a pre-req like the CLI/DX
+// plugin: we detect and instruct, never download or auto-install.
 //
 // Usage:
 //   node validate_prerequisites.mjs [projectDir]
@@ -17,8 +28,14 @@
 //
 // Output JSON (file): { ok, inAppDir, pomExists, muleArtifactExists,
 //   parentDeclared, parentFound, parentPath, cliPresent, dxPluginPresent,
-//   errors[], warnings[], notes[] }. `ok` is true when errors[] is empty.
-//   Exit code: 1 when errors[] is non-empty.
+//   mavenVersion, mavenInRange, errors[], warnings[], notes[] }. `ok` is true when
+//   errors[] is empty. Exit code: 1 when errors[] is non-empty.
+
+// Required Maven line (major 3, minor 9, any patch). See header note. The label
+// is derived from these so user-facing messages never hardcode the version.
+const MAVEN_REQUIRED_MAJOR = 3;
+const MAVEN_REQUIRED_MINOR = 9;
+const MAVEN_REQUIRED_LABEL = `${MAVEN_REQUIRED_MAJOR}.${MAVEN_REQUIRED_MINOR}.x`;
 
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
@@ -38,6 +55,24 @@ function tryExec(cmd, args) {
   if (r.error) return { ok: false, out: "", error: r.error.message };
   const combined = `${r.stdout || ""}${r.stderr || ""}`.trim();
   return { ok: r.status === 0, out: combined };
+}
+
+// Parse "Apache Maven 3.9.6 (...)" from `mvn -v`. Returns { major, minor, patch,
+// version } or null.
+function parseMavenVersion(out) {
+  const m = /Apache Maven\s+(\d+)\.(\d+)(?:\.(\d+))?/i.exec(out);
+  if (!m) return null;
+  return {
+    major: Number(m[1]),
+    minor: Number(m[2]),
+    patch: m[3] ? Number(m[3]) : 0,
+    version: `${m[1]}.${m[2]}${m[3] ? "." + m[3] : ""}`,
+  };
+}
+
+// True when the parsed Maven version is on the required 3.9.x line (any patch).
+function isMavenOnRequiredLine(v) {
+  return v.major === MAVEN_REQUIRED_MAJOR && v.minor === MAVEN_REQUIRED_MINOR;
 }
 
 function main() {
@@ -60,6 +95,8 @@ function main() {
     parentPath: null,
     cliPresent: false,
     dxPluginPresent: false,
+    mavenVersion: null,
+    mavenInRange: false,
     errors: [],
     warnings: [],
     notes: [],
@@ -130,6 +167,29 @@ function main() {
       result.errors.push("DX plugin not found. Install: npm install -g @salesforce/anypoint-cli-dx-mule-plugin");
     } else {
       log("✅ DX plugin found");
+    }
+  }
+
+  // Local Maven on the required 3.9.x line. Detect-and-instruct only —
+  // never download or auto-install (Maven is a standard toolchain pre-req).
+  const mvn = tryExec("mvn", ["-v"]);
+  const parsedMvn = mvn.ok ? parseMavenVersion(mvn.out) : null;
+  if (!parsedMvn) {
+    log("❌ Maven not found");
+    result.errors.push(
+      `Maven not found on PATH. This skill requires Maven ${MAVEN_REQUIRED_LABEL} (MMP 4.x and MUnit need it). Put an Apache Maven ${MAVEN_REQUIRED_LABEL} bin/ first on PATH and re-run.`
+    );
+  } else {
+    result.mavenVersion = parsedMvn.version;
+    const onLine = isMavenOnRequiredLine(parsedMvn);
+    result.mavenInRange = onLine;
+    if (onLine) {
+      log(`✅ Maven ${parsedMvn.version} (on the required ${MAVEN_REQUIRED_LABEL} line)`);
+    } else {
+      log(`❌ Maven ${parsedMvn.version} is not on the required ${MAVEN_REQUIRED_LABEL} line`);
+      result.errors.push(
+        `Maven ${parsedMvn.version} found, but this skill requires Maven ${MAVEN_REQUIRED_LABEL} (MMP 4.x and MUnit need it). Switch to a Maven ${MAVEN_REQUIRED_LABEL} distribution and re-run.`
+      );
     }
   }
 
