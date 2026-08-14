@@ -14,16 +14,23 @@
 // min-mule-version, or compare against the target Java/Mule (a later step does
 // that — finding the latest version that supports the target runtime).
 //
-// The single Exchange call is `exchange asset describe <groupId>/<assetId>/<version>`
-// (an exact lookup — no fuzzy `asset list`). Two conditions HARD-STOP the upgrade,
-// because without them we cannot say anything about the connector's Java support:
-//   1. describe fails (after retries) — the connector/version is not resolvable in
-//      Exchange (missing, wrong coordinates, yanked version, or an auth failure).
+// The primary Exchange call is `exchange asset describe <groupId>/<assetId>/<version>`
+// (an exact lookup). Conditions that HARD-STOP the upgrade:
+//   1. describe of the current version fails AND an existence probe shows the asset
+//      is genuinely absent from Exchange (missing, wrong coordinates, or an auth
+//      failure) — nothing to upgrade to.
 //   2. describe succeeds but carries NO is-java-*-supported tags — Exchange has no
 //      Java compatibility information for it, so we "cannot proceed".
 // A version present but declaring support for NO Java version (all tags "false")
 // is NOT a stop here — that is real information ("supports: none"); whether a newer
 // version supports the target runtime is decided by the later step.
+//
+// Delisted-version case (NOT a stop): when describe of the current version fails,
+// we probe with `exchange asset list <assetId>` and require an EXACT groupId+assetId
+// GA match. If the asset exists (only the app's old pinned version was delisted),
+// we do NOT block — the Step 3 baseline build already proved the current version
+// runs on the current Java, and Step 6 verifies the target version. Only a probe
+// that finds no match is a genuine "not on Exchange" stop.
 //
 // Retries: describe is retried a few times with a short gap so a transient network
 // / auth blip is not mistaken for "not on Exchange". The CLI error is generic, so
@@ -44,6 +51,7 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve, join } from "node:path";
+import { listExactGaRows } from "../lib/anypoint.mjs";
 
 // Don't crash if a downstream consumer (e.g. `head`) closes stdout early.
 process.stdout.on("error", (e) => { if (e.code === "EPIPE") process.exit(0); });
@@ -90,6 +98,12 @@ function describeWithRetry(coord) {
     if (attempt < DESCRIBE_ATTEMPTS) sleep(DESCRIBE_GAP_MS);
   }
   return last;
+}
+
+// Existence probe (used only when describing the current version fails): true when
+// an exact groupId+assetId row exists (only the pinned version was delisted).
+function assetExistsOnExchange(groupId, artifactId) {
+  return listExactGaRows(groupId, artifactId).length > 0;
 }
 
 // The CLI prints a "Fetching..." preamble before the JSON body. Slice from the
@@ -194,13 +208,26 @@ function main() {
     const coord = `${c.groupId}/${c.artifactId}/${c.version}`;
     const res = describeWithRetry(coord);
 
-    // 2. describe failed after retries -> not resolvable in Exchange.
+    // 2. describe of the current version failed. Delisted old version (asset still
+    //    on Exchange) -> not a stop; genuinely absent -> stop.
     if (!res.ok) {
+      if (assetExistsOnExchange(c.groupId, c.artifactId)) {
+        const note =
+          `${c.groupId}:${c.artifactId} ${c.version}: this version is delisted from Exchange, ` +
+          `so its Java compatibility could not be verified. The connector itself is still ` +
+          `available on Exchange, so the upgrade continues.`;
+        entry.currentVersionDelisted = true;
+        entry.warning = note;
+        result.warnings.push(note);
+        result.connectors.push(entry);
+        continue;
+      }
       entry.blocked = true;
       entry.blockReason =
-        `Not found in Exchange (describe failed after ${DESCRIBE_ATTEMPTS} attempts). ` +
-        `The connector/version may be missing, have different published coordinates, ` +
-        `or this may be an authentication issue. CLI said: ${(res.err || res.out).trim() || "(no output)"}`;
+        `Not found in Exchange (describe failed after ${DESCRIBE_ATTEMPTS} attempts and ` +
+        `no exact-GA match from asset list). The connector may be missing, have different ` +
+        `published coordinates, or this may be an authentication issue. ` +
+        `CLI said: ${(res.err || res.out).trim() || "(no output)"}`;
       result.connectors.push(entry);
       result.blocked.push(nick);
       continue;

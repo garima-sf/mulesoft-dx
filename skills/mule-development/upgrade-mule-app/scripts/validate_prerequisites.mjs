@@ -27,8 +27,11 @@
 //   otherwise <projectDir>/tmp/upgrade-prereqs.json.
 //
 // Output JSON (file): { ok, inAppDir, pomExists, muleArtifactExists,
-//   parentDeclared, parentFound, parentPath, cliPresent, dxPluginPresent,
-//   mavenVersion, mavenInRange, errors[], warnings[], notes[] }. `ok` is true when
+//   parentDeclared, parentFound, parentPath, ancestorChain[], cliPresent,
+//   dxPluginPresent, mavenVersion, mavenInRange, errors[], warnings[], notes[] }.
+//   ancestorChain[] is every local ancestor POM path (nearest-first) discovered by
+//   walking the full <relativePath> chain; parent{Declared,Found,Path} describe the
+//   immediate parent only (retained for backward compatibility). `ok` is true when
 //   errors[] is empty. Exit code: 1 when errors[] is non-empty.
 
 // Required Maven line (major 3, minor 9, any patch). See header note. The label
@@ -93,6 +96,7 @@ function main() {
     parentDeclared: false,
     parentFound: false,
     parentPath: null,
+    ancestorChain: [], // every local ancestor POM path, nearest-first (parent, grandparent, …)
     cliPresent: false,
     dxPluginPresent: false,
     mavenVersion: null,
@@ -123,28 +127,58 @@ function main() {
   }
   result.inAppDir = result.pomExists && result.muleArtifactExists;
 
-  // Parent POM availability (only if the child POM parsed).
+  // Ancestor-chain availability (only if the child POM parsed). Walk the FULL
+  // local <relativePath> chain — parent, grandparent, … — not just the immediate
+  // parent: Step 5's extractor and Steps 14/18's fork consume the whole chain
+  // (a connector version can live in the grandparent). A missing hop must fail
+  // HERE with a clear message, not surface much later as an unresolved-version
+  // error at Step 5. parentDeclared/parentFound/parentPath are retained for the
+  // immediate parent (backward-compatible fields); ancestorChain[] is the full list.
   if (result.pomExists) {
     try {
-      const childProject = readPomProject(childPomPath);
-      result.parentDeclared = !!child(childProject, "parent");
-      if (result.parentDeclared) {
-        const parentPath = findParentPomPath(childProject, childPomPath);
-        if (parentPath) {
-          result.parentFound = true;
-          result.parentPath = parentPath;
-          log(`✅ Parent POM found: ${parentPath}`);
-        } else {
-          result.parentFound = false;
-          log("❌ Parent POM declared but not found locally");
+      let curProject = readPomProject(childPomPath);
+      let curPath = childPomPath;
+      const seen = new Set([childPomPath]);
+      let depth = 0;
+      while (true) {
+        const declaresParent = !!child(curProject, "parent");
+        if (depth === 0) result.parentDeclared = declaresParent;
+        if (!declaresParent) break;
+
+        const nextPath = findParentPomPath(curProject, curPath);
+        const label = depth === 0 ? "Parent" : depth === 1 ? "Grandparent" : `Ancestor (depth ${depth + 1})`;
+
+        if (!nextPath) {
+          if (depth === 0) result.parentFound = false;
+          log(`❌ ${label} POM declared but not found locally`);
           result.errors.push(
-            "Child pom.xml declares a <parent>, but the parent POM was not found " +
-            "at a local relative path (from <parent><relativePath>, or the default " +
-            "../pom.xml). It is required for version detection and for Phase 2 edits " +
-            "(inherited connector/plugin versions). Ask the user to make the parent " +
-            "POM available locally and re-run. Do NOT download it."
+            `${label} POM is declared (a <parent> ${depth + 1} hop(s) up from the child) but was not ` +
+            "found at a local relative path (from <parent><relativePath>, or the default " +
+            "../pom.xml). The full ancestor chain is required for version detection (Step 2/5) and " +
+            "Phase 2 edits (inherited connector versions live in ancestors; Steps 14/18 edit and fork " +
+            "them). Ask the user to make the POM available locally and re-run. Do NOT download it."
           );
+          break;
         }
+
+        if (seen.has(nextPath)) break; // cycle guard
+        seen.add(nextPath);
+        result.ancestorChain.push(nextPath);
+        if (depth === 0) {
+          result.parentFound = true;
+          result.parentPath = nextPath;
+        }
+        log(`✅ ${label} POM found: ${nextPath}`);
+
+        try {
+          curProject = readPomProject(nextPath);
+        } catch (e) {
+          log(`❌ Failed to parse ${label.toLowerCase()} POM ${nextPath}`);
+          result.errors.push(`Failed to parse ancestor POM ${nextPath}: ${e.message}`);
+          break;
+        }
+        curPath = nextPath;
+        depth += 1;
       }
     } catch (e) {
       log("❌ Failed to parse pom.xml");
