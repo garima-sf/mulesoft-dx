@@ -13,6 +13,78 @@ function _write(p, content) { writeFileSync(p, content); }
 function _escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 /**
+ * Byte ranges of every `<!-- ... -->` comment in the document. Used to keep the
+ * regex-based writers from editing commented-out markup (a stale <dependency> or
+ * <plugin> a team left disabled must stay a comment, never get "bumped").
+ * @param {string} text
+ * @returns {Array<[number, number]>} [start, end) pairs, in document order.
+ */
+function _commentRanges(text) {
+  const ranges = [];
+  const re = /<!--[\s\S]*?-->/g;
+  for (const m of text.matchAll(re)) ranges.push([m.index, m.index + m[0].length]);
+  return ranges;
+}
+
+/** True when `index` falls inside any comment range. */
+function _inComment(index, ranges) {
+  for (const [s, e] of ranges) {
+    if (index >= s && index < e) return true;
+  }
+  return false;
+}
+
+/**
+ * Map a composite `${a}.${b}...`-style version expression to the per-property
+ * values that make it resolve to `targetVersion`. Handles the shapes the read
+ * side (`resolveValue`) resolves and that a POM realistically uses to split a
+ * version across properties:
+ *   - `${major}.${minor}.${patch}` → {major:'1', minor:'8', patch:'1'}
+ *   - `1.7.${patch}` (literal + property) → {patch:'1'} (literals must already match)
+ *   - `v${x}` / prefixed segments → the property gets the segment minus the literal
+ *
+ * The mapping is DETERMINISTIC, not a guess: the expression is tokenised into an
+ * exact regex whose only capture groups are the `${prop}` refs, then matched
+ * against `targetVersion`. A property that appears twice must resolve to the SAME
+ * value (back-reference) or the match fails. Returns:
+ *   - a `{propName: value}` map when the target maps cleanly, OR
+ *   - `null` when it can't be mapped safely (literal mismatch, wrong segment
+ *     count, or one property forced to two different values) — the caller then
+ *     warns instead of writing a wrong value.
+ * @param {string} expr The raw `<version>` text, e.g. "${email.major}.${email.minor}.${email.patch}".
+ * @param {string} targetVersion The resolved target, e.g. "1.8.1".
+ * @returns {Record<string,string>|null}
+ */
+export function decomposeComposite(expr, targetVersion) {
+  const props = [];
+  let pattern = '';
+  let i = 0;
+  const re = /\$\{([^}]+)\}/g;
+  let m;
+  while ((m = re.exec(expr)) !== null) {
+    // Literal text between the previous ref and this one must match verbatim.
+    pattern += _escapeRegExp(expr.slice(i, m.index));
+    const name = m[1];
+    const prevIdx = props.indexOf(name);
+    if (prevIdx >= 0) {
+      // Repeated property → back-reference so both sites must agree.
+      pattern += `\\${prevIdx + 1}`;
+    } else {
+      props.push(name);
+      pattern += '(.+?)';
+    }
+    i = m.index + m[0].length;
+  }
+  pattern += _escapeRegExp(expr.slice(i));
+  if (props.length === 0) return null; // not composite — no ${...} refs
+  const matched = new RegExp(`^${pattern}$`).exec(targetVersion);
+  if (!matched) return null; // literals/segment-count don't line up with the target
+  const out = {};
+  for (let k = 0; k < props.length; k++) out[props[k]] = matched[k + 1];
+  return out;
+}
+
+/**
  * Replace body of `<tag>...</tag>` inline (whole document, all occurrences).
  * @param {string} text Full document text.
  * @param {string} tag Element local name.
@@ -21,8 +93,10 @@ function _escapeRegExp(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
  */
 export function replaceElement(text, tag, newValue) {
   const pat = new RegExp(`(<${_escapeRegExp(tag)}>)([^<]*)(</${_escapeRegExp(tag)}>)`, 'g');
+  const comments = _commentRanges(text);
   let changed = false;
-  const out = text.replace(pat, (m, open, body, close) => {
+  const out = text.replace(pat, (m, open, body, close, offset) => {
+    if (_inComment(offset, comments)) return m; // never edit inside <!-- ... -->
     if (body === newValue) return m;
     changed = true;
     return `${open}${newValue}${close}`;
@@ -195,15 +269,14 @@ export function editMuleArtifact(artifactPath, targetMule, targetJava, log) {
     changes.push(`minMuleVersion=${minMule}`);
   }
 
-  // Always ensure javaSpecificationVersions is present and includes the target
-  // Java, inserting the array if the manifest omits it entirely.
+  // Set javaSpecificationVersions to exactly the target Java. This is a REPLACE,
+  // not an append: an upgrade drops the EOL Java the app used to support (e.g.
+  // moving to 17 must not leave a stale "8" claiming the app still runs on it).
+  // Also covers the insert-if-absent case for a manifest that omits it entirely.
   const existing = artifact.javaSpecificationVersions;
-  if (!existing || (Array.isArray(existing) && existing.length === 0)) {
+  if (!Array.isArray(existing) || existing.length !== 1 || existing[0] !== targetJava) {
     artifact.javaSpecificationVersions = [targetJava];
     changes.push(`javaSpecificationVersions=[${targetJava}]`);
-  } else if (!existing.includes(targetJava)) {
-    artifact.javaSpecificationVersions = [...new Set([...existing, targetJava])];
-    changes.push(`javaSpecificationVersions+=${targetJava}`);
   }
 
   if (changes.length > 0) {
@@ -220,9 +293,11 @@ export function editMuleArtifact(artifactPath, targetMule, targetJava, log) {
 // well-formed Maven pom.xml (elements only, no namespaces on Maven POM tags).
 function _findDependencyBlocks(text) {
   const blocks = [];
+  const comments = _commentRanges(text);
   const depRe = /<dependency>([\s\S]*?)<\/dependency>/g;
   const matches = text.matchAll(depRe);
   for (const m of matches) {
+    if (_inComment(m.index, comments)) continue; // skip commented-out dependencies
     blocks.push({ start: m.index, end: m.index + m[0].length, inner: m[1], full: m[0] });
   }
   return blocks;
@@ -322,6 +397,25 @@ export function editPomDependency(pomPath, gav, log) {
     return;
   }
 
+  // Composite / nested version (e.g. ${major}.${minor}.${patch}, 1.7.${patch}).
+  // Map the target back onto the component properties deterministically and bump
+  // each — never overwrite the composite expression with a literal (that would
+  // destroy the property structure the POM deliberately uses). If it can't be
+  // mapped cleanly, warn and leave it for the operator rather than guess.
+  if (/\$\{[^}]+\}/.test(vText)) {
+    const decomposed = decomposeComposite(vText, newVersion);
+    if (!decomposed) {
+      log.push({ file: pomPath, status: 'warn', reason: `composite version ${vText} could not be mapped to target ${newVersion} (irregular shape) — left unchanged, bump its component properties by hand` });
+      return;
+    }
+    let changed = false;
+    for (const [name, val] of Object.entries(decomposed)) {
+      if (setProperty(pomPath, name, val, log)) changed = true;
+    }
+    log.push({ file: pomPath, status: changed ? 'ok' : 'no-op', from: vText, to: newVersion, properties: decomposed });
+    return;
+  }
+
   // Inline version
   const oldVersion = vText;
   if (oldVersion === newVersion) {
@@ -339,8 +433,10 @@ export function editPomDependency(pomPath, gav, log) {
 
 function _findPluginBlocks(text) {
   const blocks = [];
+  const comments = _commentRanges(text);
   const re = /<plugin>([\s\S]*?)<\/plugin>/g;
   for (const m of text.matchAll(re)) {
+    if (_inComment(m.index, comments)) continue; // skip commented-out plugins
     blocks.push({ start: m.index, end: m.index + m[0].length, inner: m[1], full: m[0] });
   }
   return blocks;
@@ -695,4 +791,289 @@ export function editFlowXsdUrls(projectDir, namespacePrefix, namespaceMetadata, 
       log.push({ file: flowFile, status: 'error', reason: e.message });
     }
   }
+}
+
+// ---------- Parent-POM fork primitives (Step 18) ----------
+//
+// These are the WRITE-side counterparts to _pom_utils.mjs's read-side chain
+// walk. They are all POM-path-parameterized (operate on ANY pom.xml, not just
+// the child) and single-purpose so the Step 18 orchestrator can compose them:
+// bump the versions an ancestor owns, fork that ancestor's own <version>, then
+// repoint the downstream <parent> ref. Regex-based like the rest of this file,
+// so original whitespace/layout is preserved.
+
+/**
+ * Locate every `<dependencyManagement>…</dependencyManagement>` region so a
+ * dependency-block edit can be told whether it sits under management or under a
+ * live `<dependencies>`. Returns [{start,end}] byte ranges over `text`.
+ * @param {string} text
+ * @returns {Array<{start:number, end:number}>}
+ */
+function _dependencyManagementRanges(text) {
+  const ranges = [];
+  const re = /<dependencyManagement>[\s\S]*?<\/dependencyManagement>/g;
+  for (const m of text.matchAll(re)) {
+    ranges.push({ start: m.index, end: m.index + m[0].length });
+  }
+  return ranges;
+}
+
+/**
+ * Set a single `<properties>` child element's value in place. Only rewrites an
+ * EXISTING property — never inserts (an ancestor that doesn't declare the
+ * property doesn't own it, so there is nothing to fork there). Rewrites the
+ * property wherever it is declared in the file, but scoped to the FIRST
+ * `<properties>` block (Maven's project-level properties); a `<profiles>`-local
+ * property is intentionally not touched.
+ * @param {string} pomPath
+ * @param {string} name Property local-name, e.g. "app.runtime" or "db.version".
+ * @param {string} value New value.
+ * @param {Array<object>} log
+ * @returns {boolean} true when a change was written.
+ */
+export function setProperty(pomPath, name, value, log) {
+  if (!existsSync(pomPath)) {
+    log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found', property: name });
+    return false;
+  }
+  let text = _read(pomPath);
+  const propsMatch = text.match(/<properties>([\s\S]*?)<\/properties>/);
+  if (!propsMatch) {
+    log.push({ file: pomPath, status: 'not-found', reason: 'no <properties> block', property: name });
+    return false;
+  }
+  const propRe = new RegExp(`(<${_escapeRegExp(name)}>)([^<]*)(</${_escapeRegExp(name)}>)`);
+  const bodyMatch = propsMatch[1].match(propRe);
+  if (!bodyMatch) {
+    log.push({ file: pomPath, status: 'not-found', reason: `property ${name} not declared`, property: name });
+    return false;
+  }
+  const oldValue = bodyMatch[2].trim();
+  if (oldValue === value) {
+    log.push({ file: pomPath, status: 'no-op', property: name, from: oldValue, to: value });
+    return false;
+  }
+  const propsStart = propsMatch.index + '<properties>'.length;
+  const oldBody = propsMatch[1];
+  const newBody = oldBody.replace(propRe, (m, open, _b, close) => `${open}${value}${close}`);
+  text = text.slice(0, propsStart) + newBody + text.slice(propsStart + oldBody.length);
+  _write(pomPath, text);
+  log.push({ file: pomPath, status: 'ok', property: name, from: oldValue, to: value });
+  return true;
+}
+
+/**
+ * Bump a connector's `<version>` at EVERY site it is declared in one POM —
+ * across both `<dependencies>` and `<dependencyManagement>` — for the matching
+ * groupId+artifactId. Mirrors the read side, which resolves a version from
+ * either region:
+ *   - inline `<version>x.y.z</version>` → rewritten in place;
+ *   - `<version>${prop}</version>` → the referenced `<properties>` entry is
+ *     bumped instead (so a property shared by several connectors is a single
+ *     edit; each connector site is a no-op that records which property it rode);
+ *   - a version-less managed dependency → the site carrying the `<version>`
+ *     (the dependencyManagement entry) is the one edited.
+ * Composite/nested `${a}.${b}` versions in a live dependency are left to the
+ * property bumps of their parts — this writer only follows a WHOLE-string
+ * `${prop}` ref, matching how an ancestor typically owns a single version prop.
+ * @param {string} pomPath
+ * @param {{groupId:string, artifactId:string, version:string}} gav Target GAV.
+ * @param {Array<object>} log
+ * @returns {boolean} true when at least one site (inline or property) changed.
+ */
+export function bumpDependencyVersionSites(pomPath, gav, log) {
+  if (!existsSync(pomPath)) {
+    log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found' });
+    return false;
+  }
+  let text = _read(pomPath);
+  const { groupId, artifactId, version: newVersion } = gav;
+  const dmRanges = _dependencyManagementRanges(text);
+  const inDm = (pos) => dmRanges.some((r) => pos >= r.start && pos < r.end);
+
+  const blocks = _findDependencyBlocks(text).filter(
+    (b) => _pluckChild(b.inner, 'groupId') === groupId && _pluckChild(b.inner, 'artifactId') === artifactId,
+  );
+  if (blocks.length === 0) {
+    log.push({ file: pomPath, status: 'not-found', reason: `dependency ${groupId}:${artifactId} not declared here` });
+    return false;
+  }
+
+  // Two passes so property edits and inline edits don't shift each other's
+  // offsets: first collect what to do, then apply inline edits back-to-front and
+  // property edits by name. A ${prop} site defers to setProperty.
+  const propNames = new Set();          // whole-${prop} sites → property gets newVersion
+  const compositeProps = new Map();     // composite ${a}.${b} sites → propName -> its own value
+  const inlineEdits = []; // {start, end, innerNew}
+  const results = [];
+  for (const b of blocks) {
+    const region = inDm(b.start) ? 'dependencyManagement' : 'dependencies';
+    const vMatch = b.inner.match(/<version>([^<]*)<\/version>/);
+    if (!vMatch) {
+      results.push({ status: 'skip', region, reason: 'no <version> — inherits from a managed/parent site' });
+      continue;
+    }
+    const vText = vMatch[1].trim();
+    const whole = vText.match(/^\$\{([^}]+)\}$/);
+    if (whole) {
+      propNames.add(whole[1]);
+      results.push({ status: 'via-property', region, property: whole[1] });
+      continue;
+    }
+    if (/\$\{[^}]+\}/.test(vText)) {
+      // Composite/nested (e.g. ${major}.${minor}.${patch}, 1.7.${patch}). Map the
+      // target back onto the component properties deterministically; each property
+      // is then bumped to ITS OWN value below. If the target can't be mapped
+      // cleanly (literal mismatch / segment-count / conflicting property), warn —
+      // never write a wrong value. The verify pass re-resolves via resolveValue.
+      const decomposed = decomposeComposite(vText, newVersion);
+      if (decomposed) {
+        for (const [name, val] of Object.entries(decomposed)) {
+          const prev = compositeProps.get(name);
+          if (prev !== undefined && prev !== val) {
+            // Same property forced to two different values across sites — unsafe.
+            log.push({ file: pomPath, status: 'warn', dependency: `${groupId}:${artifactId}`, reason: `composite version ${vText} maps property \${${name}} to conflicting values (${prev} vs ${val}) — left unchanged, bump by hand` });
+            compositeProps.delete(name);
+          } else {
+            compositeProps.set(name, val);
+          }
+        }
+        results.push({ status: 'via-composite', region, from: vText, to: newVersion, properties: decomposed });
+      } else {
+        log.push({ file: pomPath, status: 'warn', dependency: `${groupId}:${artifactId}`, reason: `composite version ${vText} could not be mapped to target ${newVersion} (irregular shape) — left unchanged, bump its component properties by hand` });
+        results.push({ status: 'skip', region, from: vText, reason: `composite ${vText} not mappable to ${newVersion} — operator attention` });
+      }
+      continue;
+    }
+    if (vText === newVersion) {
+      results.push({ status: 'no-op', region, from: vText, to: newVersion });
+      continue;
+    }
+    const innerNew = b.inner.replace(/<version>[^<]*<\/version>/, `<version>${newVersion}</version>`);
+    inlineEdits.push({ start: b.start, end: b.end, innerNew });
+    results.push({ status: 'ok', region, from: vText, to: newVersion });
+  }
+
+  let changed = false;
+  for (const e of [...inlineEdits].sort((a, c) => c.start - a.start)) {
+    text = text.slice(0, e.start) + `<dependency>${e.innerNew}</dependency>` + text.slice(e.end);
+    changed = true;
+  }
+  if (changed) _write(pomPath, text);
+
+  // Whole-${prop} sites: bump each referenced property once to the full target
+  // (setProperty reads fresh from disk, so it sees the inline edits above).
+  for (const prop of propNames) {
+    if (setProperty(pomPath, prop, newVersion, log)) changed = true;
+  }
+  // Composite sites: bump each component property to ITS OWN decomposed value.
+  for (const [name, val] of compositeProps) {
+    if (setProperty(pomPath, name, val, log)) changed = true;
+  }
+
+  log.push({ file: pomPath, status: changed ? 'ok' : 'no-op', dependency: `${groupId}:${artifactId}`, to: newVersion, sites: results });
+  return changed;
+}
+
+/**
+ * Bump a POM's OWN top-level `<project><version>` — the fork. The hazard is that
+ * a POM contains many `<version>` elements (inside `<parent>`, every
+ * `<dependency>`, every `<plugin>`); only the project-level one may move. This
+ * targets the `<version>` that is a DIRECT child of `<project>`: the first
+ * `<version>` that appears after the `</parent>` close (or after `<modelVersion>`
+ * when there is no `<parent>`) and before the first `<dependencies>`/`<build>`/
+ * `<dependencyManagement>`/`<properties>` section.
+ * @param {string} pomPath
+ * @param {string} newVersion
+ * @param {Array<object>} log
+ * @returns {{changed:boolean, from:string|null}}
+ */
+export function bumpOwnVersion(pomPath, newVersion, log) {
+  if (!existsSync(pomPath)) {
+    log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found' });
+    return { changed: false, from: null };
+  }
+  let text = _read(pomPath);
+
+  // Anchor the search window: after </parent> if present, else after
+  // <modelVersion>. End it at the first section that can carry nested <version>s.
+  const parentClose = text.indexOf('</parent>');
+  const afterParent = parentClose >= 0 ? parentClose + '</parent>'.length : 0;
+  const modelVer = text.match(/<modelVersion>[^<]*<\/modelVersion>/);
+  const afterModel = modelVer ? modelVer.index + modelVer[0].length : 0;
+  const windowStart = Math.max(afterParent, afterModel);
+
+  const sectionRe = /<(dependencies|dependencyManagement|build|properties|profiles|modules)\b/;
+  const rest = text.slice(windowStart);
+  const secMatch = rest.match(sectionRe);
+  const windowEnd = secMatch ? windowStart + secMatch.index : text.length;
+
+  const window = text.slice(windowStart, windowEnd);
+  const verRe = /<version>([^<]*)<\/version>/;
+  const vm = window.match(verRe);
+  if (!vm) {
+    log.push({ file: pomPath, status: 'not-found', reason: 'no project-level <version> element to fork' });
+    return { changed: false, from: null };
+  }
+  const oldVersion = vm[1].trim();
+  if (oldVersion === newVersion) {
+    log.push({ file: pomPath, status: 'no-op', ownVersion: { from: oldVersion, to: newVersion } });
+    return { changed: false, from: oldVersion };
+  }
+  const abs = windowStart + vm.index;
+  text = text.slice(0, abs) + `<version>${newVersion}</version>` + text.slice(abs + vm[0].length);
+  _write(pomPath, text);
+  log.push({ file: pomPath, status: 'ok', ownVersion: { from: oldVersion, to: newVersion } });
+  return { changed: true, from: oldVersion };
+}
+
+/**
+ * Repoint a POM's `<parent><version>` to `newVersion` — the downstream half of a
+ * fork (after the parent's own <version> was bumped, its children must follow).
+ * Edits ONLY the `<version>` inside the `<parent>` block, leaving the project's
+ * own version and all dependency/plugin versions untouched. Optionally verifies
+ * the block's coordinates match the expected parent GAV before editing.
+ * @param {string} pomPath
+ * @param {string} newVersion
+ * @param {Array<object>} log
+ * @param {{groupId?:string, artifactId?:string}} [expect] Optional identity check.
+ * @returns {{changed:boolean, from:string|null}}
+ */
+export function repointParentVersion(pomPath, newVersion, log, expect = {}) {
+  if (!existsSync(pomPath)) {
+    log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found' });
+    return { changed: false, from: null };
+  }
+  let text = _read(pomPath);
+  const parentMatch = text.match(/<parent>([\s\S]*?)<\/parent>/);
+  if (!parentMatch) {
+    log.push({ file: pomPath, status: 'not-found', reason: 'no <parent> block' });
+    return { changed: false, from: null };
+  }
+  const inner = parentMatch[1];
+  if (expect.artifactId && _pluckChild(inner, 'artifactId') !== expect.artifactId) {
+    log.push({ file: pomPath, status: 'skip', reason: `<parent> artifactId ${_pluckChild(inner, 'artifactId')} != expected ${expect.artifactId}` });
+    return { changed: false, from: null };
+  }
+  if (expect.groupId && _pluckChild(inner, 'groupId') !== expect.groupId) {
+    log.push({ file: pomPath, status: 'skip', reason: `<parent> groupId ${_pluckChild(inner, 'groupId')} != expected ${expect.groupId}` });
+    return { changed: false, from: null };
+  }
+  const vMatch = inner.match(/<version>([^<]*)<\/version>/);
+  if (!vMatch) {
+    log.push({ file: pomPath, status: 'not-found', reason: '<parent> has no <version>' });
+    return { changed: false, from: null };
+  }
+  const oldVersion = vMatch[1].trim();
+  if (oldVersion === newVersion) {
+    log.push({ file: pomPath, status: 'no-op', parentVersion: { from: oldVersion, to: newVersion } });
+    return { changed: false, from: oldVersion };
+  }
+  const innerNew = inner.replace(/<version>[^<]*<\/version>/, `<version>${newVersion}</version>`);
+  const start = parentMatch.index;
+  const end = start + parentMatch[0].length;
+  text = text.slice(0, start) + `<parent>${innerNew}</parent>` + text.slice(end);
+  _write(pomPath, text);
+  log.push({ file: pomPath, status: 'ok', parentVersion: { from: oldVersion, to: newVersion } });
+  return { changed: true, from: oldVersion };
 }

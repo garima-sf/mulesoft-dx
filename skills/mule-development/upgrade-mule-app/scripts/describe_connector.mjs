@@ -68,7 +68,7 @@ if (!env.ALLOW_LEGACY_JAVA_FOR_DESCRIBE) {
   if (parsed.major === null || parsed.major < 17) {
     stderr.write(`❌ describe_connector.mjs: Java ${parsed.major ?? '?'} detected (${versionLine}); Java 17+ is required\n`);
     stderr.write('   Under Java 8/11 the describe returns a degraded schema (empty configs[].parameters) that hides required-attribute changes.\n');
-    stderr.write('   Fix: export JAVA_HOME="$(/usr/libexec/java_home -v 17)" (or point at your Zulu-17 install) and re-run.\n');
+    stderr.write('   Fix: export JAVA_HOME="$(/usr/libexec/java_home -v 17)" (or point at a Java 17+ install) and re-run.\n');
     stderr.write('   Override: set ALLOW_LEGACY_JAVA_FOR_DESCRIBE=1 only if you truly need a legacy-JDK describe.\n');
     exit(1);
   }

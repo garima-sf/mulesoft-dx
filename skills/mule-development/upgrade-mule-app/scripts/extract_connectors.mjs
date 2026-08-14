@@ -27,14 +27,23 @@
 //   Default projectDir = cwd. Output path: ${CONNECTORS_FILE} when set,
 //   otherwise <projectDir>/tmp/connectors.json.
 //
-// Output JSON (file): { projectDir, connectors[], excluded[], needsUserPrompt,
-//   warnings[], notes[] }. Each connector: { nick, groupId, artifactId, version,
-//   versionResolved, scope, resolvedFrom, versionManagedIn? }. `resolvedFrom` is
-//   "child" | "parent" | "ancestor" (grandparent+). `version` is null
-//   ONLY when it could not be resolved from any local POM (remote-only parent or
-//   imported BOM). `versionManagedIn` is set (to the ancestor POM path) when the
+// Output JSON (file): { projectDir, connectors[], excluded[], customLibraries[],
+//   needsUserPrompt, warnings[], notes[] }. Each connector: { nick, groupId,
+//   artifactId, version, versionResolved, scope, resolvedFrom, versionManagedIn? }.
+//   `resolvedFrom` is "child" | "parent" | "ancestor" (grandparent+). `version` is
+//   null ONLY when it could not be resolved from any local POM (remote-only parent
+//   or imported BOM). `versionManagedIn` is set (to the ancestor POM path) when the
 //   version came from an ancestor's <dependencyManagement> — i.e. where an edit
 //   must happen.
+//
+// `customLibraries[]` holds the app's non-connector, non-test, non-platform
+// dependencies (a shared error-handler jar, a util lib, a direct third-party jar):
+// { groupId, artifactId, version, versionResolved, rawVersion, scope, classifier,
+//   resolvedFrom }. The skill does NOT auto-upgrade these (no Exchange target
+//   exists); they are surfaced so Step 12 can flag them for the operator — they may
+//   have been compiled against the old Java/runtime and break after the upgrade.
+//   Platform groups (org.mule.*, com.mulesoft.*) and test/provided scopes are
+//   suppressed as non-customer noise.
 //
 // Exit code:
 //   0  always — extraction is advisory; the caller branches on connectors /
@@ -65,6 +74,21 @@ function log(msg) {
 // The classifier that marks a dependency as a Mule 4 plugin (connector or
 // plugin tooling). Connectors and MUnit tooling both use it.
 const MULE_PLUGIN_CLASSIFIER = "mule-plugin";
+
+// GroupId prefixes that are platform-provided (the Mule runtime / MuleSoft ship
+// them) — a non-connector dependency under these is NOT a customer library, so it
+// is suppressed from customLibraries[]. Everything else that is a plain jar
+// (no mule-plugin classifier) and not test-scoped is a candidate custom library:
+// a shared error-handler jar, a util lib, a third-party dependency the app pulls
+// in directly. The skill cannot introspect or upgrade these (not on Exchange), so
+// they are collected here to be flagged for the operator at plan time (Step 12),
+// never auto-bumped.
+const PLATFORM_GROUP_PREFIXES = ["org.mule", "com.mulesoft"];
+
+function isPlatformGroup(groupId) {
+  const g = String(groupId || "");
+  return PLATFORM_GROUP_PREFIXES.some((p) => g === p || g.startsWith(p + "."));
+}
 
 // Derive a short, stable nickname from an artifactId, matching the sibling
 // build-mule-integration convention (e.g. mule-amazon-s3-connector -> s3,
@@ -112,6 +136,46 @@ function collectPluginDeps(project, mergedProps, resolvedFrom) {
   return out;
 }
 
+// Collect every <dependency> that is NOT a mule-plugin and NOT test-scoped and
+// NOT platform-provided — the custom / third-party libraries the app depends on
+// directly (a shared error-handler jar, a util lib, etc.). The skill cannot
+// resolve a "latest compatible" for these (they are not Exchange connectors), so
+// it never bumps them; it collects them so Step 12 can flag them for the operator
+// (they were likely compiled against the old Java/runtime and may break after the
+// upgrade). Version resolution mirrors connectors: a value that stays a ${...}
+// ref yields version: null (still worth flagging by GA).
+function collectCustomLibs(project, mergedProps, resolvedFrom) {
+  const out = [];
+  const deps = child(project, "dependencies");
+  if (!deps) return out;
+  for (const dep of children(deps, "dependency")) {
+    const classifier = textOf(child(dep, "classifier"));
+    if (classifier === MULE_PLUGIN_CLASSIFIER) continue; // connectors handled elsewhere
+
+    const scope = textOf(child(dep, "scope")) || "compile";
+    if (scope === "test" || scope === "provided") continue; // test/provided are not shipped app libs
+
+    const groupId = textOf(child(dep, "groupId"));
+    if (isPlatformGroup(groupId)) continue; // platform-provided, not a customer lib
+
+    const artifactId = textOf(child(dep, "artifactId"));
+    const rawVersion = textOf(child(dep, "version"));
+    const resolved = rawVersion ? resolveValue(rawVersion, mergedProps) : null;
+
+    out.push({
+      groupId,
+      artifactId,
+      version: resolved || null,
+      versionResolved: !!resolved,
+      rawVersion: rawVersion || null,
+      scope,
+      classifier: classifier || null,
+      resolvedFrom,
+    });
+  }
+  return out;
+}
+
 function main() {
   const argv = process.argv.slice(2);
   let projectDir = process.cwd();
@@ -125,6 +189,7 @@ function main() {
     projectDir,
     connectors: [],        // real, Exchange-resolvable connectors (Step 5b input)
     excluded: [],          // mule-plugin deps that are NOT connectors, with a reason
+    customLibraries: [],   // non-connector app jars — flagged for operator at Step 12, never auto-bumped
     needsUserPrompt: false,
     warnings: [],
     notes: [],
@@ -243,6 +308,30 @@ function main() {
     }
   }
 
+  // Custom / third-party libraries: non-connector app jars from child + ancestors,
+  // deduped by groupId:artifactId (nearest declaration wins, same as connectors).
+  // These are collected, warned about, and flagged for the operator at Step 12 —
+  // never auto-upgraded (the skill can't resolve a target for a non-Exchange jar).
+  const customByGa = new Map();
+  for (const d of [
+    ...collectCustomLibs(childProject, mergedProps, "child"),
+    ...ancestors.map((a, i) =>
+      collectCustomLibs(a.project, mergedProps, i === 0 ? "parent" : "ancestor")
+    ).flat(),
+  ]) {
+    const key = `${d.groupId}:${d.artifactId}`;
+    if (!customByGa.has(key)) customByGa.set(key, d); // nearest declaration wins
+  }
+  for (const d of customByGa.values()) {
+    result.customLibraries.push(d);
+    const v = d.versionResolved ? d.version : (d.rawVersion || "version inherited");
+    result.warnings.push(
+      `Non-connector dependency ${d.groupId}:${d.artifactId} (${v}) found — the skill ` +
+      `will NOT auto-upgrade it (not an Exchange connector). It may have been compiled ` +
+      `against the old Java/runtime; flagged for operator confirmation at plan time (Step 12).`
+    );
+  }
+
   if (result.connectors.length === 0) {
     result.needsUserPrompt = true;
     if (parentDeclaredButMissing) {
@@ -274,6 +363,13 @@ function emit(result, outPath) {
   }
   if (result.excluded.length) {
     log(`ℹ️  Excluded ${result.excluded.length} test-scoped mule-plugin dep(s) (e.g. MUnit tooling).`);
+  }
+  if (result.customLibraries.length) {
+    log(`⚠️  Found ${result.customLibraries.length} non-connector dependency(ies) — NOT auto-upgraded, flagged for operator at Step 12:`);
+    for (const d of result.customLibraries) {
+      const v = d.versionResolved ? d.version : (d.rawVersion || "(version inherited)");
+      log(`   • ${d.groupId}:${d.artifactId} ${v}`);
+    }
   }
   for (const w of result.warnings) log(`   • ${w}`);
 

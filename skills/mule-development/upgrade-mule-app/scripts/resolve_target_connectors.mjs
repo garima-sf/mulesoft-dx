@@ -45,6 +45,7 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { dirname, resolve, join } from "node:path";
+import { listExactGaRows } from "../lib/anypoint.mjs";
 
 process.stdout.on("error", (e) => { if (e.code === "EPIPE") process.exit(0); });
 function log(msg) { process.stdout.write(msg + "\n"); }
@@ -110,6 +111,17 @@ function parseCliJson(out) {
   const start = arrStart === -1 ? objStart : (objStart === -1 ? arrStart : Math.min(objStart, arrStart));
   if (start === -1) return null;
   try { return JSON.parse(out.slice(start)); } catch { return null; }
+}
+
+// When describing the pinned version fails, return the newest GA sibling to re-anchor
+// the describe: highest exact groupId+assetId version, pre-releases excluded. Null if none.
+function newestGaVersionOnExchange(groupId, artifactId) {
+  const versions = listExactGaRows(groupId, artifactId)
+    .map((a) => a.version)
+    .filter((v) => v && !isPreRelease(v))
+    .map(String)
+    .sort((a, b) => cmpVersion(b, a));
+  return versions[0] || null;
 }
 
 // Read a keyed tag value (e.g. min-mule-version) off a version entry.
@@ -246,13 +258,23 @@ function main() {
       continue;
     }
 
-    const coord = `${c.groupId}/${c.artifactId}/${c.version}`;
-    const res = describeWithRetry(coord);
+    let res = describeWithRetry(`${c.groupId}/${c.artifactId}/${c.version}`);
+
+    // Current version delisted? Re-anchor the describe on the newest GA sibling so
+    // we can still read `.versions[]`. Only a genuinely-absent asset blocks here.
+    if (!res.ok) {
+      const anchor = newestGaVersionOnExchange(c.groupId, c.artifactId);
+      if (anchor) {
+        const note = `${c.groupId}:${c.artifactId} ${c.version}: this version is delisted from Exchange; resolving the target from the newest available version (${anchor}) instead.`;
+        result.warnings.push(note);
+        res = describeWithRetry(`${c.groupId}/${c.artifactId}/${anchor}`);
+      }
+    }
     if (!res.ok) {
       entry.blocked = true;
       entry.blockReason =
-        `Not found in Exchange (describe failed after ${DESCRIBE_ATTEMPTS} attempts). ` +
-        `CLI said: ${(res.err || res.out).trim() || "(no output)"}`;
+        `Not found in Exchange (describe failed after ${DESCRIBE_ATTEMPTS} attempts and ` +
+        `no exact-GA match from asset list). CLI said: ${(res.err || res.out).trim() || "(no output)"}`;
       result.connectors.push(entry);
       result.blocked.push(nick);
       continue;
