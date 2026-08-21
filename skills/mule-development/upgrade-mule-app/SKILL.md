@@ -743,10 +743,51 @@ Every diff residue MUST appear in Step 12's plan (`tmp/upgrade-plan.md`) as an e
 
 ## Step 8: Check Custom Java Compatibility
 
-(To be implemented)
+**No scripts, and nothing deterministic here.** Unlike the connector steps (Mode-A/B/C metadata → mechanical per-symbol rewrites) or even DataWeave (Step 9's fixed pattern catalog), custom Java in a Mule app has **no machine-readable contract and no canonical fix**. There is no describe, no XSD, no `tmp/*.json` to diff against. The agent reads the app's own Java **source** directly at plan-synthesis time (Step 12) with the `Read` tool and reasons about each site using its own knowledge of the Java migration. The bar for this step is **functional correctness**: an upgraded app that invokes custom Java classes must still compile *and* behave the same at runtime — not merely produce a green `mvn package`.
 
-- Identify custom Java classes (if any)
-- Flag potential Java version incompatibilities
+**Run this step only when the upgrade crosses a Java version boundary — the one deterministic gate here.** Compare `currentJava` (`tmp/current-java-version.json` `.version`) with `targetJava` (the confirmed target from Step 4). If `targetJava == currentJava` (e.g. a Mule-runtime-only bump that keeps the app on the same Java), **no Java version boundary is crossed, so no version-introduced breaking changes are possible** — record "skipped — Java unchanged (`<currentJava>` → `<targetJava>`)" for the plan and move on. Only when `targetJava > currentJava` do the FIX/FLAG analysis below. (This skill never downgrades.)
+
+**Flag only what actually changes between `currentJava` and `targetJava`.** Each breakage below is anchored to the Java version that introduced it — flag a hit only when that version falls **inside the source→target span**. This self-gates for any span without a hardcoded ceiling: an 8→17 move crosses the Java 11 removals *and* the 16/17 encapsulation; an 11→17 move only the latter; and a change introduced *above* `targetJava` (e.g. the UTF-8-default flip at Java 18) is out of span and must not be flagged. Don't chase generic "behavior might drift" concerns that aren't tied to a concrete removed/encapsulated/deprecated API at a known version.
+
+**Why a green build is not enough here.** Only the source-compile surfaces (below) are caught by `mvn`. The majority of custom-Java breakage — reflection blocked by module encapsulation, a Spring bean that fails to instantiate, a serialization graph that no longer round-trips, a security provider that was removed — surfaces **only at deploy/runtime**, which a `-DskipTests` build never exercises. So this step splits into two dispositions:
+
+- **Fix** — surfaces the agent can read and rewrite. Propose the concrete edit in the plan.
+- **Flag** — runtime-only surfaces the skill can neither verify nor safely auto-edit. Record them as operator-attention items so the user knows, at the approval gate, that build-success does not prove these are safe.
+
+**Scope — the app's own source and flow touchpoints, never opaque jars.** The opaque `customLibraries[]` jars from Step 5 are pre-compiled binaries the skill can't read or fix; they already have their own operator-confirmation path (Step 5a → plan §Custom / non-connector libraries → Step 12.4). Do **not** re-examine or make compatibility claims about them here.
+
+First, find what exists. If there is no custom Java source and no `<java:*>` / `java!` / `<spring:bean>` usage, this step is a no-op — record "none — no custom Java in app" for the plan and continue:
+
+```bash
+find src/main/java src/test/java -name '*.java' 2>/dev/null
+grep -rlE '<java:(invoke|new|invoke-static)|java!|<spring:bean' src/main/mule src/main/resources 2>/dev/null
+```
+
+### 8a. FIX surfaces — read the source and propose edits
+
+Read every `.java` under `src/main/java/**` and `src/test/java/**` (test Java breaks the Step 17 MUnit run just as surely as main Java breaks the Step 16 build), plus the classes reached from flows via `<java:invoke>` / `<java:new>` / `<java:invoke-static>` and from DataWeave `java!` callouts into app classes. The three that actually bite a Mule app — each flagged only if its version falls inside the `currentJava`→`targetJava` span:
+
+1. **Removed JDK / Java EE modules (JEP 320, gone in Java 11)** — `import javax.xml.bind.*` (JAXB), `javax.xml.ws.*`/`javax.jws.*` (JAX-WS), `javax.activation.*`, `javax.annotation.*`, `javax.xml.soap.*`, `javax.transaction.*`, CORBA (`org.omg.*`). Compiles on 8, fails on 11+ with `package … does not exist`. Fix = add the standalone `jakarta.*` dependency (or migrate the namespace). **Record the exact coordinate in the plan — the dependency add is a Step 15.4 edit.**
+2. **Restricted JDK internals (JEP 396/403, encapsulated in Java 16/17)** — `sun.*`, `com.sun.*` internal, `jdk.internal.*` (`sun.misc.Unsafe`, `BASE64Encoder`, `sun.security.*`). May compile but throw `InaccessibleObjectException` at runtime. Prefer the public replacement (`BASE64Encoder` → `java.util.Base64`, `Unsafe` → `VarHandle`); only when none exists, record the `--add-opens`/`--add-exports` (runtime config, not `pom.xml`).
+3. **Locale default (JEP 252, Java 9+)** — `SimpleDateFormat` / `DateTimeFormatter` / `NumberFormat` **without an explicit `Locale`** picks up CLDR data; month/day names and separators drift. Pin the `Locale`. (The related UTF-8-default flip, JEP 400, lands at Java 18 — flag it only if `targetJava >= 18`.)
+4. **Removed / deprecated-for-removal methods** — `Class.newInstance()` → `getDeclaredConstructor().newInstance()`; boxed-primitive constructors `new Integer(…)` → `Integer.valueOf(…)`; `Thread.stop`/`Thread.destroy`, `Runtime`/`System.runFinalizersOnExit()`, and the removed `SecurityManager.check*` variants → the documented replacement. Most of these compile-warn rather than hard-fail at ≤17, so rank them below (1)/(2); still record them.
+
+This is a **memory aid, not an allow-list** — reason about *any* API the file uses that changed between source and target Java, not only the four above. For each hit, record in Step 12's plan: **`file:line`** · **the problematic line** · **category (removed package / restricted internal / deprecated method / locale)** · **proposed fix**. Never claim "no custom-Java impact" without having read the files the `find`/`grep` above turned up.
+
+### 8b. FLAG surfaces — runtime-only, operator must confirm
+
+These involve custom Java but fail (if they fail) only when the app deploys or runs — a compile-clean, `-DskipTests` build will not catch them, and the skill has no way to verify them. Record each occurrence as a **Known risk / operator-attention** bullet in the plan, with the `file:line` and why it might break — do **not** auto-edit:
+
+- **Reflection into JDK modules** — `setAccessible(true)` on `java.*` members, cross-module `Field`/`Method` access: throws `InaccessibleObjectException` at runtime on Java 16/17+ even though it compiles. Note the `--add-opens` / `--add-exports` the app would need (these belong in the app's launch/runtime config, not `pom.xml`).
+- **Spring beans instantiated by class** — `<spring:bean class="…">` in `src/main/resources/**` and imported bean files: the class must load and construct on the target Java; a constructor that trips an 8a pattern fails at context startup.
+- **Serializable state crossing a boundary** — objects persisted to Object Store, put on a VM queue, or replicated in a cluster: a serialization graph referencing removed `javax.*` types, or a changed `serialVersionUID`, breaks deserialization of already-persisted data after the upgrade.
+- **Custom security / crypto / TLS Java** — a custom `java.security.Provider`, hardcoded algorithm/provider names, custom `KeyStore`/`TrustManager`: Java 17 removed and re-ordered providers and disabled weak algorithms; behavior can change silently.
+- **Custom logging appenders** — a Java `log4j2` appender class referenced from `log4j2.xml`: compiled against the old Java, loaded at startup.
+
+This step is **discovery only** — read and flag, but make **no edits** (Phase 1 writes nothing to project files). 8a findings become the plan's "Custom Java downstream impact" section; 8b findings fold into the plan's "Known risks / operator-attention items" section. The actual 8a source rewrites and dependency additions happen in Step 15.4; 8b items are surfaced to the operator at the Step 12.4 gate.
+
+- Identify custom Java in the app (`src/main/java`, `src/test/java`, `<java:*>` flow calls, `java!`, Spring beans)
+- Flag potential Java version incompatibilities against the target Java — fix the readable source, flag the runtime-only surfaces
 
 ---
 
@@ -1003,6 +1044,14 @@ For every DW consumer that reads output from an op the plan will rewrite:
   - Absent, sibling present (probable rename): proposed rewrite (with source citation)
   - Absent AND Mode-B has NO .output* keys: SITE FLAGGED FOR OPERATOR
 
+## Custom Java downstream impact
+Findings from Step 8a (read from `src/main/java/**`, `src/test/java/**`, `<java:invoke>`/`<java:new>`/`<java:invoke-static>` targets, and `java!` callouts). One bullet per site the upgrade must edit for the app to compile/run on the target Java, in the format `file:line · problematic line · category · proposed fix`:
+- `<file>:<line>` · `<verbatim problematic line>` · <category: removed package / restricted internal / deprecated method / locale> · <proposed fix> (e.g. `src/main/java/com/acme/XmlBinder.java:12 · import javax.xml.bind.*; · removed package (JEP 320, gone in Java 11) · add jakarta.xml.bind:jakarta.xml.bind-api:4.0.x + jaxb-runtime, or migrate to jakarta.*`)
+- For any fix that adds a dependency, state the exact coordinate here — the add is applied in Step 15.4.
+- (write "none — no custom Java source impact" if Step 8a found nothing; do NOT write this without having read the files `find`/`grep` surfaced)
+
+Step 8b runtime-only surfaces (Spring beans, Serializable state, custom security/TLS, custom log4j appenders, JDK-module reflection) are NOT listed here — they go under §Known risks / operator-attention items because the skill can't verify them and a green build doesn't prove them safe.
+
 ## Parent-POM forks (shared ancestor edits)
 The ancestor counterpart to the child edits below — lists exactly which shared POMs the upgrade will bump (Step 14) then version-fork + repoint (Step 18). **Do NOT hand-derive this from `connectors.json` and do NOT recall owners from memory** — that is the class of error a free-authored list introduces (a connector reported under the wrong ancestor). Instead render it from the fork script's own owner→connector computation. Run its edit-phase dry-run once (writes nothing — it only reads Step 5's `connectors.json` and Step 6's `target-connectors.json`, both already on disk):
 
@@ -1048,6 +1097,7 @@ Enumerated from `connectors.json .customLibraries[]` (Step 5) — the app's non-
 
 ## Known risks / operator-attention items
 - Java-window warnings, DW sites flagged for operator, true-removal ops with no rename target, etc.
+- **Custom-Java runtime-only surfaces (Step 8b)** — Spring beans instantiated by class, Serializable state crossing Object Store / VM / cluster, custom security/crypto/TLS Java, custom log4j2 appenders, and JDK-module reflection (`setAccessible` / `--add-opens`). One bullet per `file:line` with why it may break on the target Java. These compile clean and a `-DskipTests` build will NOT exercise them — the operator must confirm at the Step 12.4 gate that they are safe on Java `<targetJava>`, since build-success does not prove it.
 - Dependency-tree cross-check discrepancies (from Step 12.0 `dep-tree-verify-existing.json`): any connector whose Maven-resolved version disagrees with our discovery, or resolves from outside the editable local chain (imported BOM / transitive / stale `~/.m2`) — a Step 14/18 edit to the discovered site may not take. One bullet per mismatch, citing our value, Maven's value, and the likely cause.
 ```
 
@@ -1236,6 +1286,16 @@ MUnit has no dedicated plan section — its edits fall out of the same op rename
 - Update `<munit-tools:fail>` and `<on-error-propagate type="…">` in MUnit error paths per the plan's error-type map.
 
 `mvn test` (Step 17) is the authoritative gate for these edits.
+
+### 15.4 Custom Java edits (plan §Custom Java downstream impact)
+
+Apply exactly the source rewrites the plan enumerated from Step 8a — no new discoveries, no new choices (everything requiring judgment was resolved during planning). These are ordinary `Edit`s to `.java` files plus any dependency add the plan specified:
+
+- **Source rewrites** — for each `file:line` bullet, `Read` the file for context, then `Edit` the offending API to the plan's proposed replacement (e.g. `javax.xml.bind.*` import → the `jakarta.*` equivalent, `Class.newInstance()` → `getDeclaredConstructor().newInstance()`, `new String(bytes)` → the charset-explicit form). Preserve behavior — a charset/locale fix must pin the value the code relied on implicitly, not an arbitrary one.
+- **Dependency adds** — when the plan says a removed JDK module needs a standalone dependency, add the exact `<dependency>` coordinate the plan named to `pom.xml`. This is the only case where Step 15 touches `pom.xml` for a non-version reason; it is still a plan-approved edit, not a discovery.
+- **Never edit an 8b (FLAG) item here.** Runtime-only surfaces (Spring beans, Serializable state, security/TLS, log4j appenders, JDK-module reflection) were flagged for the operator, not fixed. If a build/test failure later implicates one, HALT and route back to Step 12 — do not silently rewrite a flagged site.
+
+`mvn clean package` (Step 16) is the gate for `src/main/java` edits; `mvn test` (Step 17) is the gate for `src/test/java` and MUnit-Java edits. A compile-clean build does **not** clear the 8b runtime surfaces — those remain the operator's confirmed risk.
 
 Summary of what Step 15 touches:
 
