@@ -123,12 +123,79 @@ export function insertProperty(text, tag, value) {
   if (tagRe.test(body)) return { text, inserted: false };
   const indentMatch = body.match(/\n([ \t]+)</);
   const indent = indentMatch ? indentMatch[1] : '    ';
-  const trailingIndent = indent.length >= 4 ? indent.slice(0, indent.length - 4) : '';
+  // Preserve the closing tag's ORIGINAL indentation (the whitespace that sat
+  // just before </properties>) rather than guessing a fixed 4-space dedent —
+  // tab-indented POMs would otherwise lose the closing tag's indent.
+  const closeIndentMatch = body.match(/\n([ \t]*)$/);
+  const trailingIndent = closeIndentMatch ? closeIndentMatch[1] : '';
   const newBody = `${body.replace(/\s+$/, '')}\n${indent}<${tag}>${value}</${tag}>\n${trailingIndent}`;
   const start = m.index + m[1].length;
   const end = start + body.length;
   const newText = text.slice(0, start) + newBody + text.slice(end);
   return { text: newText, inserted: true };
+}
+
+/**
+ * True when `dir` (recursively) contains a `.java` file. Gates the compiler-level
+ * insert: javac only checks the source level when there are sources to compile.
+ * Missing/unreadable dir → false.
+ * @param {string} dir
+ * @returns {boolean}
+ */
+function _hasJavaFiles(dir) {
+  if (!existsSync(dir)) return false;
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return false;
+  }
+  for (const e of entries) {
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) {
+      if (_hasJavaFiles(full)) return true;
+    } else if (e.name.endsWith('.java')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when a `maven-compiler-plugin` block declares a `<source>`, `<target>`,
+ * or `<release>` level (the plugin-config form the property-tag replace loop in
+ * editPomRuntime does NOT catch). Comment-safe via `_findPluginBlocks`.
+ * @param {string} text
+ * @returns {boolean}
+ */
+function _compilerPluginHasLevel(text) {
+  for (const b of _findPluginBlocks(text)) {
+    if (_pluckChild(b.inner, 'artifactId') === 'maven-compiler-plugin') {
+      if (/<(?:source|target|release)>[^<]*<\/(?:source|target|release)>/.test(b.inner)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * True when a compiler-level property is present (non-comment). Detects by
+ * PRESENCE, not by whether we changed it — a property already at target is
+ * `changed:false` yet still declared, and must not trigger a redundant insert.
+ * @param {string} text
+ * @returns {boolean}
+ */
+function _hasLevelProperty(text) {
+  const tags = [
+    'maven.compiler.source', 'maven.compiler.target', 'maven.compiler.release',
+    'java.version', 'jdk.version', 'javaVersion',
+  ];
+  const comments = _commentRanges(text);
+  for (const t of tags) {
+    for (const m of text.matchAll(new RegExp(`<${_escapeRegExp(t)}>`, 'g'))) {
+      if (!_inComment(m.index, comments)) return true;
+    }
+  }
+  return false;
 }
 
 // ---------- Runtime + Java bump (edit_pom + edit_mule_artifact) ----------
@@ -151,7 +218,8 @@ export function editPomRuntime(pomPath, targetMule, targetJava, muleMavenPlugin,
   const changes = [];
 
   // Java-related tags: bumped in place only if present, never inserted when
-  // absent (a POM that doesn't declare them shouldn't sprout new ones).
+  // absent (a POM that doesn't declare them shouldn't sprout new ones). The one
+  // exception is the maven.compiler.release insert below, gated on custom Java.
   const tags = [
     ['javaVersion', targetJava],
     ['maven.compiler.source', targetJava],
@@ -215,6 +283,24 @@ export function editPomRuntime(pomPath, targetMule, targetJava, muleMavenPlugin,
       status: 'warn',
       reason: 'no mule-maven-plugin version supplied (Step 11a) — leaving <mule.maven.plugin.version> unchanged',
     });
+  }
+
+  // Compiler level: with none declared, javac uses an ancient default that
+  // JDK >= 9 rejects ("Source option 5 is no longer supported"), failing the
+  // build. Only matters when there's Java to compile. So if custom Java exists
+  // and no level is declared here (property or plugin config), insert the target.
+  // A declared level is left alone (property form already bumped in place above).
+  const projectDir = path.dirname(pomPath);
+  const hasJavaSources =
+    _hasJavaFiles(path.join(projectDir, 'src/main/java')) ||
+    _hasJavaFiles(path.join(projectDir, 'src/test/java'));
+  const compilerLevelDeclared = _hasLevelProperty(text) || _compilerPluginHasLevel(text);
+  if (hasJavaSources && !compilerLevelDeclared) {
+    const ins = insertProperty(text, 'maven.compiler.release', targetJava);
+    if (ins.inserted) {
+      text = ins.text;
+      changes.push(`maven.compiler.release=${targetJava} (inserted — custom Java, no compiler level declared)`);
+    }
   }
 
   if (text !== original) {
@@ -534,16 +620,19 @@ function _setDependencyVersionInText(text, target) {
 /**
  * Bump every MUnit version site in pom.xml to `version`, deterministically.
  *
- * MUnit spreads across up to three shapes, and a real pom can mix them (a
+ * MUnit spreads across several shapes, and a real pom can mix them (a
  * `<munit.version>` property that some artifacts reference and others ignore in
- * favour of a hardcoded literal — seen in the wild). This bumps all of them in
- * one pass so no site is left stale:
+ * favour of a hardcoded literal — seen in the wild). This bumps every version
+ * site in one pass so none is left stale:
  *   - the `<munit.version>` property (if declared),
  *   - the `munit-maven-plugin` `<plugin>` block's literal version,
- *   - the `munit-runner` / `munit-tools` `<dependency>` blocks' literal versions.
- * Every writer skips `${property}` versions (those already ride the property
- * bumped above), so a property-driven pom is a single clean edit and a
- * literal-driven pom rewrites each element. Per the MUnit-in-Maven docs the
+ *   - the `munit-runner` / `munit-tools` `<dependency>` blocks' literal versions,
+ *   - any property referenced by a MUnit `${prop}` version (deps or plugin),
+ *     whatever it is named — e.g. `<munit-runner.version>` /
+ *     `<munit-tools.version>` or a custom `<munit.plugin.version>` — so a
+ *     property-driven pom under a non-`munit.version` name isn't silently skipped.
+ * The literal writers skip `${property}` versions; the reference pass bumps the
+ * property those refs point at (mirrors the follow in `editPomDependency`). Per the MUnit-in-Maven docs the
  * groupIds differ: the `munit-maven-plugin` is `com.mulesoft.munit.tools`, while
  * the `munit-runner` / `munit-tools` dependencies are `com.mulesoft.munit`.
  *
@@ -586,6 +675,38 @@ export function editMunitVersion(pomPath, version, log) {
     }
   }
 
+  // The literal passes above skip ${...} versions, so follow every MUnit
+  // ${prop} reference to its property and bump that (deps or plugin, whatever
+  // the property is named). Each property bumped once — a shared one is one edit.
+  const refProps = []; // { propName, from }
+  // munit-runner / munit-tools dependency <version> refs.
+  for (const b of _findDependencyBlocks(text)) {
+    if (_pluckChild(b.inner, 'groupId') !== DEP_GROUP) continue;
+    const artifactId = _pluckChild(b.inner, 'artifactId');
+    if (artifactId !== 'munit-runner' && artifactId !== 'munit-tools') continue;
+    const refMatch = _pluckChild(b.inner, 'version').match(/^\$\{([^}]+)\}$/);
+    if (refMatch) refProps.push({ propName: refMatch[1], from: artifactId });
+  }
+  // munit-maven-plugin <version> ref.
+  for (const b of _findPluginBlocks(text)) {
+    if (_pluckChild(b.inner, 'artifactId') !== 'munit-maven-plugin') continue;
+    const gid = _pluckChild(b.inner, 'groupId');
+    if (gid && gid !== PLUGIN_GROUP) continue;
+    const refMatch = _pluckChild(b.inner, 'version').match(/^\$\{([^}]+)\}$/);
+    if (refMatch) refProps.push({ propName: refMatch[1], from: 'munit-maven-plugin' });
+  }
+
+  const bumpedProps = new Set(['munit.version']); // already handled above
+  for (const { propName, from } of refProps) {
+    if (bumpedProps.has(propName)) continue;
+    bumpedProps.add(propName);
+    const ref = replaceElement(text, propName, version);
+    if (ref.changed) {
+      text = ref.text;
+      changes.push(`${propName}=${version} (property ref from ${from})`);
+    }
+  }
+
   if (text !== original) {
     _write(pomPath, text);
     log.push({ file: pomPath, status: 'applied', changes });
@@ -595,31 +716,25 @@ export function editMunitVersion(pomPath, version, log) {
 }
 
 /**
- * Pin the munit-maven-plugin's embedded test runtime to `<app.runtime>` by
- * inserting `<runtimeVersion>${app.runtime}</runtimeVersion>` into its
- * `<configuration>` block.
+ * Pin the munit-maven-plugin's embedded test runtime to the target runtime.
  *
- * Why this is required: MUnit selects its embedded runtime from
- * `<runtimeVersion>` when set, otherwise it falls back to the app's
- * `minMuleVersion` from mule-artifact.json. Since we (correctly) write
- * `minMuleVersion` as the `x.y.0` feature line, that fallback would boot the
- * `x.y.0` runtime — whose bundled `mule-sdk-api` `JavaVersion` enum can lack
- * newer constants (e.g. JAVA_25). Connectors compiled against the target
- * patch's `@SupportedJavaVersions` then throw `EnumConstantNotPresentException`
- * during extension-model parsing and MUnit never runs. Pinning `runtimeVersion`
- * to `${app.runtime}` (the full target patch, set by editPomRuntime) forces the
- * test runtime to match the deploy runtime, independent of the feature-line
- * floor.
+ * Why required: MUnit picks its runtime from <runtimeVersion>, else falls back
+ * to minMuleVersion. We write minMuleVersion as the x.y.0 feature line, so that
+ * fallback boots the x.y.0 runtime — whose bundled mule-sdk-api JavaVersion enum
+ * can lack newer constants (e.g. JAVA_25). Connectors compiled against the target
+ * patch then throw EnumConstantNotPresentException and MUnit never runs. Pinning
+ * runtimeVersion forces the test runtime to match the deploy runtime.
  *
- * Uses the `${app.runtime}` property (not a literal) so the test runtime tracks
- * the same single source of truth the deploy profiles use. Insert-if-absent:
- * an existing `<runtimeVersion>` (a team's deliberate pin) is left untouched.
- * No-op when the munit-maven-plugin block is absent.
+ * ${prop} reference → bump the named property to targetRuntime; literal pin →
+ * left untouched; absent → insert ${app.runtime}. No-op if the plugin is absent.
  *
  * @param {string} pomPath
+ * @param {string|null} targetRuntime Target runtime (`.mule.to`, the full patch);
+ *   used only to bump a `${prop}`-referenced `<runtimeVersion>`. When absent, a
+ *   property-referenced pin is left unchanged (with a warn).
  * @param {Array<object>} log Mutated with a per-file status entry.
  */
-export function editMunitRuntimeVersion(pomPath, log) {
+export function editMunitRuntimeVersion(pomPath, targetRuntime, log) {
   if (!existsSync(pomPath)) {
     log.push({ file: pomPath, status: 'error', reason: 'pom.xml not found' });
     return;
@@ -634,9 +749,39 @@ export function editMunitRuntimeVersion(pomPath, log) {
     return;
   }
 
-  // Already pinned — never clobber a deliberate value.
+  // Already declared. A ${prop} reference is followed and its property bumped to
+  // the target runtime; a literal pin is a deliberate value and left untouched.
+  const rvMatch = block.inner.match(/<runtimeVersion>([^<]*)<\/runtimeVersion>/);
+  if (rvMatch) {
+    const refMatch = rvMatch[1].trim().match(/^\$\{([^}]+)\}$/);
+    if (refMatch) {
+      const propName = refMatch[1];
+      if (!targetRuntime) {
+        log.push({ file: pomPath, status: 'warn', reason: `runtimeVersion references \${${propName}} but no target runtime supplied — left unchanged` });
+        return;
+      }
+      const ref = replaceElement(text, propName, targetRuntime);
+      if (ref.changed) {
+        _write(pomPath, ref.text);
+        log.push({ file: pomPath, status: 'applied', changes: [`${propName}=${targetRuntime} (runtimeVersion property ref)`] });
+      } else {
+        // No change: don't claim "already X" for a property absent here (it may
+        // live in a parent) — distinguish absent from already-at-target.
+        const declared = new RegExp(`<${_escapeRegExp(propName)}>`).test(text);
+        const reason = declared
+          ? `runtimeVersion property ${propName} already ${targetRuntime}`
+          : `runtimeVersion references \${${propName}} but that property is not declared in this pom — left unchanged`;
+        log.push({ file: pomPath, status: 'no-op', reason });
+      }
+      return;
+    }
+    // Literal pin — deliberate, never clobber.
+    log.push({ file: pomPath, status: 'no-op', reason: 'runtimeVersion is a literal pin — left untouched' });
+    return;
+  }
   if (/<runtimeVersion>/.test(block.inner)) {
-    log.push({ file: pomPath, status: 'no-op', reason: 'runtimeVersion already present' });
+    // Present but not a simple <runtimeVersion>value</runtimeVersion> shape — leave it.
+    log.push({ file: pomPath, status: 'no-op', reason: 'runtimeVersion present (unrecognized shape) — left untouched' });
     return;
   }
 
