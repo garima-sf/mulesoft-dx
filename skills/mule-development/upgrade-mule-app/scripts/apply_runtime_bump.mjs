@@ -78,8 +78,10 @@ editMunitVersion(path.join(projectDir, 'pom.xml'), targetMunit, log);
 // Pin MUnit's embedded test runtime to <app.runtime> so it doesn't fall back to
 // the x.y.0 minMuleVersion floor (which would boot an older runtime and fail
 // JAVA_25-annotated connectors). Runs regardless of whether a MUnit version was
-// supplied, since the pin is about the runtime, not the plugin version.
-editMunitRuntimeVersion(path.join(projectDir, 'pom.xml'), log);
+// supplied, since the pin is about the runtime, not the plugin version. When the
+// pin already exists as a ${prop} reference (e.g. ${munit.runtime}), that property
+// is bumped to the target runtime; a literal pin is left untouched.
+editMunitRuntimeVersion(path.join(projectDir, 'pom.xml'), targetMule, log);
 editMuleArtifact(path.join(projectDir, 'mule-artifact.json'), targetMule, targetJava, log);
 
 const summary = {
