@@ -8,18 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
-- **`upgrade-mule-app`** — parent-POM ancestor-chain fork support. When connector or runtime/plugin versions are inherited from a parent (or grandparent) POM, the skill forks the ancestor chain — bumping the connector and runtime/plugin properties, bumping the ancestor `<version>`, and repointing `<parent>` references — so only the upgraded app adopts the new versions. Includes custom-library handling.
-- **`upgrade-mule-app`** — custom-Java (`.java` sources) compatibility (Step 8): a FIX/FLAG split with a version-boundary gate that auto-applies compiler changes only within supported bounds and flags the remainder for manual review.
-
-### Changed
-
-- **`upgrade-mule-app`** — ported the skill's eight bash scripts and two Python helpers to Node.js (ESM, zero npm deps), matching the sibling `build-mule-integration` convention; shared helpers live under `upgrade-mule-app/lib/*.mjs`. Behaviour is preserved 1:1 (CLI flags, tmp-file layout, JSON schemas, exit codes). Added `*/lib/**` to the `files` array so the helpers ship in the published tarball.
-- **`upgrade-mule-app`** — resolve maven-compiler-plugin (MMP) and MUnit versions from live Maven metadata, and add a Maven 3.9.x prerequisite gate.
-
-### Fixed
-
-- **`upgrade-mule-app`** — normalize the maven-compiler-plugin level in place across property / inline / profile / execution / pluginManagement scopes, preserving the invariant that `<release>` never coexists with `<source>`/`<target>`; bump MUnit property-ref versions and `<runtimeVersion>`; and correctly handle tab-indented POM inserts.
-- **`upgrade-mule-app`** — `insertProperty` now skips commented-out `<properties>` blocks, so an inserted property (e.g. `app.runtime`, `maven.compiler.release`) always lands in the live block instead of silently no-op'ing or being written inside a comment.
+- **`upgrade-mule-app`** — new skill that upgrades a Mule application's Java and Mule Runtime version end to end. Detects the current versions, resolves a compatible target (runtime, JDK, and connector versions from live Maven metadata), and updates `pom.xml`, `mule-artifact.json`, and inherited parent POMs. Beyond bumping versions it remediates the source impact of newer connectors — renamed or removed operations, changed attributes, and error-type changes — across flow XML, DataWeave, MUnit tests, and custom-Java (`.java`) sources.
 
 ## [1.8.4] - 2026-08-10
 
