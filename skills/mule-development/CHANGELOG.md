@@ -4,12 +4,76 @@ All notable changes to `@salesforce/mulesoft-vibes-skills` are documented in thi
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.7.0] - 2026-07-27
+## [1.9.0] - 2026-08-27
+
+### Added
+
+- **`upgrade-mule-app`** — parent-POM ancestor-chain fork support. When connector or runtime/plugin versions are inherited from a parent (or grandparent) POM, the skill forks the ancestor chain — bumping the connector and runtime/plugin properties, bumping the ancestor `<version>`, and repointing `<parent>` references — so only the upgraded app adopts the new versions. Includes custom-library handling.
+- **`upgrade-mule-app`** — custom-Java (`.java` sources) compatibility (Step 8): a FIX/FLAG split with a version-boundary gate that auto-applies compiler changes only within supported bounds and flags the remainder for manual review.
 
 ### Changed
 
-- **`upgrade-mule-app`** — bumped to skill v2.0.0. Ported all eight bash scripts (`describe_connector.sh`, `enumerate_usage.sh`, `apply_connector_pin.sh`, `apply_runtime_bump.sh`, `check_java_compatibility.sh`, `get_java17_compatible_connector.sh`, `promote_new_connector_pins.sh`, `verify_metadata_coverage.sh`) and both Python helpers (`_apply_connector_pin.py`, `_apply_runtime_bump.py`) to Node.js (ESM, zero npm deps), matching the convention adopted by the sibling `build-mule-integration` skill upstream (mulesoft/mulesoft-dx#147). Shared helpers live under `upgrade-mule-app/lib/*.mjs` (`anypoint.mjs`, `fsx.mjs`, `platform.mjs`, `pom-edit.mjs`, `xml-flow.mjs`). Behaviour is preserved 1:1: identical CLI flags, tmp-file layout, JSON schemas, exit codes, and stderr copy. The pre-2.0.0 originals are retained (unmodified) under `upgrade-mule-app/scripts/archive/` for parity reference and rollback and are NOT invoked by the skill runtime. The structural rewrite of `enumerate_usage` (D-1) lands as a follow-up commit on top of `enumerate_usage.mjs`.
-- **`package.json`** — added `*/lib/**` to the `files` array so the new `upgrade-mule-app/lib/*.mjs` helpers (and any future skill's `lib/`) ship in the published tarball.
+- **`upgrade-mule-app`** — ported the skill's eight bash scripts and two Python helpers to Node.js (ESM, zero npm deps), matching the sibling `build-mule-integration` convention; shared helpers live under `upgrade-mule-app/lib/*.mjs`. Behaviour is preserved 1:1 (CLI flags, tmp-file layout, JSON schemas, exit codes). Added `*/lib/**` to the `files` array so the helpers ship in the published tarball.
+- **`upgrade-mule-app`** — resolve maven-compiler-plugin (MMP) and MUnit versions from live Maven metadata, and add a Maven 3.9.x prerequisite gate.
+
+### Fixed
+
+- **`upgrade-mule-app`** — normalize the maven-compiler-plugin level in place across property / inline / profile / execution / pluginManagement scopes, preserving the invariant that `<release>` never coexists with `<source>`/`<target>`; bump MUnit property-ref versions and `<runtimeVersion>`; and correctly handle tab-indented POM inserts.
+- **`upgrade-mule-app`** — `insertProperty` now skips commented-out `<properties>` blocks, so an inserted property (e.g. `app.runtime`, `maven.compiler.release`) always lands in the live block instead of silently no-op'ing or being written inside a comment.
+
+## [1.8.4] - 2026-08-10
+
+### Fixed
+
+- **`build-agent-broker-project`** and **`translate-agent-broker-old-to-new-project`** — Removed the incorrect claim that connection ids (`context.connections.<id>`) and broker ids (keys under `brokers:`) are restricted by the V2 schema to `^[a-z0-9_]+$` (lowercase/digits/non-trailing-underscore only) and that camelCase or kebab-case "fails lint." The schema does not enforce a snake_case-only format on these keys — any valid YAML identifier validates. The skills now frame snake_case as a readability convention and preserve the one genuine invariant: an `.agent` target (`a2a://`, `mcp://`, `llm://`, `brokers://`) must match its corresponding `agent-network.yaml` key exactly. Affects `canonical-example.md` item 0, `gotchas.md` naming conventions, and the converter's connection/broker translation notes, template comments, and example annotations.
+
+### Changed
+
+- **`build-agent-broker-project`** — Updated the Step 9 deploy/gateway guidance to the current Anypoint CLI Agent Fabric plugin (v1.2.10) gateway model: single-gateway mode (`-g/--gateway`, default `agent-network-gw`) is the recommended path, with separate ingress/egress (`-i/--ingress-gw` + `-e/--egress-gw`) as the alternate mode. Replaces the stale separate-gateway-only defaults (`agent-network-ingress-gw` / `agent-network-egress-gw`).
+
+## [1.8.3] - 2026-07-13
+
+### Fixed
+
+- **`manage-api-version`** — Step 9's rescaffold (`mvn clean package -DskipTests`) required a manual approval click in the VS Code Vibes/Agentforce UI even when the exact command was allowlisted, because the model was emitting it as `cd <projectDir> && mvn clean package -DskipTests 2>&1`. The `2>&1` stream redirection is flagged as an unsafe operator by the extension's command-approval layer (`A4dSafeCommandsController.containsUnsafeOperators()`), which forces manual approval unconditionally, before any allowlist pattern is even consulted. Step 9 now explicitly instructs the agent never to append `2>&1` or any other redirection/pipe to the `mvn` invocation — the tool call already captures full stdout/stderr, so the redirection was redundant as well as harmful. Also made explicit that this rescaffold step must run immediately with no user confirmation prompt, matching the real Anypoint Studio behavior where rescaffolding fires automatically on a `pom.xml` change or a Project Properties → API Specs tab edit and is never a user-facing decision.
+
+### Changed
+
+- Added `cd ...` and an exact-match `mvn clean package -DskipTests` line to the local `a4d_safe_commands` allowlist (developer machine config, not part of this repo) so the two sub-commands produced by Step 9 — split independently by the extension's `parseMultiCommand()` — both auto-approve once the `2>&1` redirection is removed.
+
+## [1.8.2] - 2026-07-13
+
+### Fixed
+
+- **`manage-api-version`** — Step 7c ("present available versions and handle selection") told the agent to display the version list and prompt as plain narrated chat text, then separately invoke the `AskUserQuestion` tool for the actual interactive selection — producing two renderings of the same question in the VS Code Vibes/Agentforce UI (one plain-text, one interactive). Step 7c is rewritten so the version list and prompt are presented *only* via a single `AskUserQuestion` tool call per API, with the version list as the tool's `options`; the skill no longer narrates the same content as chat text before or after the tool call.
+
+## [1.8.1] - 2026-07-13
+
+### Fixed
+
+- **`manage-api-version`** — fixed a false-negative bug in version discovery (Steps 5, 6, 7b). The skill previously relied solely on `anypoint-cli-v4 exchange asset describe <groupId>/<artifactId>/<currentVersion>` and its `otherVersions` field to enumerate an asset's available versions. That field is anchored to the queried version and has been observed to return empty when the queried version is not the latest published version on Exchange — exactly the case CHECK ALL/CHECK SPECIFIC/CHANGE hit every time, since they query from whatever version is currently pinned in `pom.xml`. This caused the skill to report "no updates available" or "only one version published" even when newer versions genuinely existed. Version discovery now uses `anypoint-cli-v4 exchange asset list <artifactId> --output json` filtered to the target `groupId`/`assetId` as the primary lookup — an asset-identity-scoped query with no version-anchoring failure mode, matching the pattern already used by `build-mule-integration/scripts/search_templates.sh` and `manage-global-configurations/scripts/get_latest_connector.sh`. The old `describe`-based lookup is retained only as a degraded fallback when `list` itself fails, with an explicit caveat surfaced to the user that the resulting list may be incomplete.
+
+### Changed
+
+- **`manage-api-version`** — added a bundled `scripts/fetch_versions.sh` helper and rewired the Version Discovery procedure (Steps 5, 6, 7b) to call it once per operation instead of looping and invoking `anypoint-cli-v4` once per API dependency. Each direct CLI invocation pays a full Node cold start plus a network round trip; the new script fires the Exchange lookup for every target API **in parallel** and returns a single JSON array, cutting wall-clock time roughly N-fold on projects with multiple API dependencies. Same pattern already used by `build-mule-integration/scripts/search_templates.sh` and `manage-global-configurations/scripts/get_latest_connector.sh`.
+
+## [1.8.0] - 2026-06-30
+
+### Added
+
+- **`manage-api-version`** — new skill for reading, checking, and updating API spec dependency versions in a Mule project. Reads `<{artifactId}.version>` properties from `pom.xml`, queries Anypoint Exchange for available versions via `anypoint-cli-v4 exchange asset describe`, and applies version changes followed by an automatic `mvn clean package -DskipTests` rescaffold. Supports four paths: display all versions, display specific versions, check all APIs for newer versions, and a full interactive change flow with semver-sorted version selection, pom.xml backup/restore on failure, and batched multi-API updates in a single Maven pass.
+
+## [1.7.0] - 2026-07-16
+
+### Added
+
+- **`author-governance-ruleset`** — new skill that authors valid Anypoint API Governance rulesets (Validation Profile 1.0 YAML) using the `anypoint-cli-v4 governance:ruleset` CLI for model discovery, validation, and simplification. Force-installs the latest governance plugin, resolves domain language to canonical target classes, discovers classes/properties/constraints per domain, then writes, validates (`validate-authoring`), and simplifies the ruleset before presenting it. Covers OpenAPI, RAML, AsyncAPI, MCP servers, Anypoint API instances, and API projects; enforces the single-specKind rule and never guesses class/property names or constraint compatibility.
+
+## 1.6.1 — 2026-07-15
+
+### Changed
+
+- **`build-agent-broker-project`** and **`translate-agent-broker-old-to-new-project`** — enforce snake_case for connection IDs and broker IDs in skill code examples per the V2 schema (`^[a-z0-9_]+$`). Prior examples emitted camelCase / kebab-case which the ACB linter rejects. Also loosens the `agent_name` rule to "optional, conventionally kebab-case" since the docs mark it optional and the field has no strict format. Verified against the authoritative docs at `mulesoft/docs-code-builder@latest/agent-network/2.0/modules/ROOT`.
 
 ## [1.6.0] - 2026-07-02
 
