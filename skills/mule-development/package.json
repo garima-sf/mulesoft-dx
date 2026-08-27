@@ -6,6 +6,7 @@
   "files": [
     "*/SKILL.md",
     "*/scripts/**",
+    "*/lib/**",
     "*/references/**",
     "*/templates/**",
     "LICENSE.txt"
