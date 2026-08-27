@@ -115,9 +115,26 @@ export function replaceElement(text, tag, newValue) {
 export function insertProperty(text, tag, value) {
   // dotall via [\s\S] since JS regex has no DOTALL flag pre-ES2018 in the
   // portable-safe subset.
-  const propRe = /(<properties>)([\s\S]*?)(<\/properties>)/;
-  const m = text.match(propRe);
-  if (!m) return { text, inserted: false };
+  // Target the first BUILD/PROFILE <properties> — never a plugin's own
+  // <properties> (e.g. mule-maven-plugin > cloudHubDeployment > <properties>),
+  // which holds deployment key/values, not project properties.
+  const pluginProps = _pluginPropertiesRanges(text);
+  let m = null;
+  for (const mm of text.matchAll(/(<properties>)([\s\S]*?)(<\/properties>)/g)) {
+    if (!_inComment(mm.index, pluginProps)) { m = mm; break; }
+  }
+  if (!m) {
+    // No <properties> block — create one (after </modelVersion>, else after the
+    // <project> open tag) so the property has a home. Without this, an app that
+    // needs a compiler level but declares no properties would get none at all.
+    const anchor = text.match(/<\/modelVersion>/) || text.match(/<project\b[^>]*>/);
+    if (!anchor) return { text, inserted: false };
+    const idx = anchor.index + anchor[0].length;
+    const indM = text.slice(idx).match(/\n([ \t]+)\S/);
+    const ind = indM ? indM[1] : '  ';
+    const block = `\n${ind}<properties>\n${ind}  <${tag}>${value}</${tag}>\n${ind}</properties>`;
+    return { text: text.slice(0, idx) + block + text.slice(idx), inserted: true };
+  }
   const body = m[2];
   const tagRe = new RegExp(`<${_escapeRegExp(tag)}>`);
   if (tagRe.test(body)) return { text, inserted: false };
@@ -162,40 +179,327 @@ function _hasJavaFiles(dir) {
 }
 
 /**
- * True when a `maven-compiler-plugin` block declares a `<source>`, `<target>`,
- * or `<release>` level (the plugin-config form the property-tag replace loop in
- * editPomRuntime does NOT catch). Comment-safe via `_findPluginBlocks`.
- * @param {string} text
- * @returns {boolean}
+ * Byte ranges of every `<properties>` block nested inside a `<plugin>` — i.e.
+ * plugin/deployment configuration properties (e.g. mule-maven-plugin >
+ * cloudHubDeployment > <properties>), NOT the project/profile build properties.
+ * The compiler level's property home is a build/profile <properties>; a
+ * `maven.compiler.*` key inside a plugin's <properties> is a deployment value and
+ * must not be read as — or rewritten into — the build compiler level.
  */
-function _compilerPluginHasLevel(text) {
+function _pluginPropertiesRanges(text) {
+  const ranges = [];
   for (const b of _findPluginBlocks(text)) {
-    if (_pluckChild(b.inner, 'artifactId') === 'maven-compiler-plugin') {
-      if (/<(?:source|target|release)>[^<]*<\/(?:source|target|release)>/.test(b.inner)) return true;
+    const base = b.start + '<plugin>'.length;
+    for (const m of b.inner.matchAll(/<properties>[\s\S]*?<\/properties>/g)) {
+      ranges.push([base + m.index, base + m.index + m[0].length]);
+    }
+  }
+  return ranges;
+}
+
+/** True when `<tag>` is declared live in a build/profile (non-plugin) `<properties>`. */
+function _hasBuildProperty(text, tag) {
+  const comments = _commentRanges(text);
+  const pluginProps = _pluginPropertiesRanges(text);
+  for (const m of text.matchAll(new RegExp(`<${_escapeRegExp(tag)}>`, 'g'))) {
+    if (_inComment(m.index, comments)) continue;
+    if (_inComment(m.index, pluginProps)) continue; // skip plugin/deployment props
+    return true;
+  }
+  return false;
+}
+
+/** Replace `<tag>` body only in build/profile (non-plugin) `<properties>` (comment-safe, all sites). */
+function _replaceBuildProperty(text, tag, newValue) {
+  const comments = _commentRanges(text);
+  const pluginProps = _pluginPropertiesRanges(text);
+  const pat = new RegExp(`(<${_escapeRegExp(tag)}>)([^<]*)(</${_escapeRegExp(tag)}>)`, 'g');
+  let changed = false;
+  const out = text.replace(pat, (m, open, body, close, offset) => {
+    if (_inComment(offset, comments) || _inComment(offset, pluginProps)) return m;
+    if (body === newValue) return m;
+    changed = true;
+    return `${open}${newValue}${close}`;
+  });
+  return { text: out, changed };
+}
+
+/** Drop a build/profile (non-plugin) `<tag>...</tag>` line (comment-safe), leaving no blank gap. */
+function _removeBuildProperty(text, tag) {
+  const re = new RegExp(`(^|\\n)([ \\t]*)<${_escapeRegExp(tag)}>[^<]*</${_escapeRegExp(tag)}>[ \\t]*(?=\\n|$)`, 'g');
+  const comments = _commentRanges(text);
+  const pluginProps = _pluginPropertiesRanges(text);
+  return text.replace(re, (m, lead, indent, offset) => {
+    const at = offset + lead.length + indent.length;
+    return (_inComment(at, comments) || _inComment(at, pluginProps)) ? m : '';
+  });
+}
+
+/**
+ * Strip every inline <source>/<target>/<release> from maven-compiler-plugin
+ * blocks so properties become the single home for the level. `present` = the
+ * plugin declared any level. Comment-safe; multi-block.
+ * @returns {{text:string, present:boolean}}
+ */
+function _stripCompilerPluginLevels(text) {
+  // Match a level tag's whole line (leading \n + indent + tag + trailing spaces,
+  // not the next newline) so dropping one leaves no blank gap.
+  const levelRe = /(^|\n)([ \t]*)<(?:source|target|release)>[^<]*<\/(?:source|target|release)>[ \t]*(?=\n|$)/g;
+  const edits = [];
+  let present = false;
+  for (const b of _findPluginBlocks(text)) {
+    if (_pluckChild(b.inner, 'artifactId') !== 'maven-compiler-plugin') continue;
+    const inner = b.inner;
+    const cr = _commentRanges(inner);
+    const hits = [];
+    for (const m of inner.matchAll(levelRe)) {
+      if (_inComment(m.index + m[1].length + m[2].length, cr)) continue;
+      hits.push(m);
+    }
+    if (hits.length === 0) continue;
+    present = true;
+    let newInner = inner;
+    // Splice last→first so earlier offsets stay valid.
+    for (let i = hits.length - 1; i >= 0; i--) {
+      const m = hits[i];
+      newInner = newInner.slice(0, m.index) + newInner.slice(m.index + m[0].length);
+    }
+    edits.push({ start: b.start, end: b.end, full: `<plugin>${newInner}</plugin>` });
+  }
+  if (edits.length === 0) return { text, present };
+  edits.sort((a, z) => z.start - a.start);
+  let out = text;
+  for (const ed of edits) out = out.slice(0, ed.start) + ed.full + out.slice(ed.end);
+  return { text: out, present };
+}
+
+/** Replace the body of every live (non-comment) `<tag>` in `text`. */
+function _replaceBodyLive(text, tag, value) {
+  const cr = _commentRanges(text);
+  return text.replace(new RegExp(`(<${tag}>)([^<]*)(</${tag}>)`, 'g'), (m, o, b, c, off) =>
+    _inComment(off, cr) ? m : `${o}${value}${c}`);
+}
+
+/** Drop the whole line holding a live `<tag>...</tag>` (comment-safe). */
+function _removeElementLine(text, tag) {
+  const re = new RegExp(`(^|\\n)([ \\t]*)<${tag}>[^<]*</${tag}>[ \\t]*(?=\\n|$)`, 'g');
+  const cr = _commentRanges(text);
+  return text.replace(re, (m, lead, ind, off) =>
+    _inComment(off + lead.length + ind.length, cr) ? m : '');
+}
+
+/** Convert a live `<from>...</from>` to `<to>value</to>` in place (keeps indent). */
+function _convertElementLive(text, from, to, value) {
+  const cr = _commentRanges(text);
+  return text.replace(new RegExp(`(<${from}>)([^<]*)(</${from}>)`, 'g'), (m, o, b, c, off) =>
+    _inComment(off, cr) ? m : `<${to}>${value}</${to}>`);
+}
+
+/** True when a level tag has a live occurrence anywhere in `inner`. */
+function _liveHas(inner, tag) {
+  const cr = _commentRanges(inner);
+  for (const m of inner.matchAll(new RegExp(`<${tag}>`, 'g')))
+    if (!_inComment(m.index, cr)) return true;
+  return false;
+}
+
+/**
+ * Bump inline maven-compiler-plugin levels in place, per block (stays in scope,
+ * e.g. inside a <profile>): <release> bumped; <source>+<target> bumped; a lone
+ * <target>/<source> converted to <release> (completing it).
+ * @returns {{text:string, present:boolean, changes:string[]}}
+ */
+function _bumpInlineCompilerLevels(text, targetJava) {
+  const changes = [];
+  let present = false;
+  const edits = [];
+  for (const b of _findPluginBlocks(text)) {
+    if (_pluckChild(b.inner, 'artifactId') !== 'maven-compiler-plugin') continue;
+    const hasSrc = _liveHas(b.inner, 'source');
+    const hasTgt = _liveHas(b.inner, 'target');
+    const hasRel = _liveHas(b.inner, 'release');
+    if (!hasSrc && !hasTgt && !hasRel) continue;
+    present = true;
+    let inner = b.inner;
+    if (hasRel) {
+      inner = _replaceBodyLive(inner, 'release', targetJava);
+      if (hasSrc) { inner = _removeElementLine(inner, 'source'); changes.push('removed inline <source> (superseded by <release>)'); }
+      if (hasTgt) { inner = _removeElementLine(inner, 'target'); changes.push('removed inline <target> (superseded by <release>)'); }
+      changes.push(`inline <release>=${targetJava}`);
+    } else if (hasSrc && hasTgt) {
+      inner = _replaceBodyLive(inner, 'source', targetJava);
+      inner = _replaceBodyLive(inner, 'target', targetJava);
+      changes.push(`inline <source>/<target>=${targetJava}`);
+    } else if (hasTgt) {
+      inner = _convertElementLive(inner, 'target', 'release', targetJava);
+      changes.push(`inline <target> → <release>${targetJava}`);
+    } else {
+      inner = _convertElementLive(inner, 'source', 'release', targetJava);
+      changes.push(`inline <source> → <release>${targetJava}`);
+    }
+    edits.push({ start: b.start, end: b.end, full: `<plugin>${inner}</plugin>` });
+  }
+  if (!edits.length) return { text, present, changes };
+  edits.sort((a, z) => z.start - a.start);
+  let out = text;
+  for (const e of edits) out = out.slice(0, e.start) + e.full + out.slice(e.end);
+  return { text: out, present, changes };
+}
+
+/** True when a maven-compiler-plugin sets the level via <compilerArgs>/<compilerArgument> (-source/-target/--release). */
+function _compilerArgsSetLevel(text) {
+  for (const b of _findPluginBlocks(text)) {
+    if (_pluckChild(b.inner, 'artifactId') !== 'maven-compiler-plugin') continue;
+    const cr = _commentRanges(b.inner);
+    for (const m of b.inner.matchAll(/<compilerArg(?:s|ument)>([\s\S]*?)<\/compilerArg(?:s|ument)>/g)) {
+      if (_inComment(m.index, cr)) continue;
+      // Trailing `=` covers the `--release=17` form; `[\s<]`/$ the space-separated form.
+      if (/(?:^|[\s>])-{1,2}(?:source|target|release)(?:[\s<=]|$)/.test(m[1])) return true;
     }
   }
   return false;
 }
 
+/** True when a test-compile level (testSource/testTarget/testRelease, prop or inline) is present. */
+function _hasTestCompileLevel(text) {
+  const cr = _commentRanges(text);
+  for (const m of text.matchAll(/<(?:maven\.compiler\.)?test(?:Source|Target|Release)>/g))
+    if (!_inComment(m.index, cr)) return true;
+  return false;
+}
+
 /**
- * True when a compiler-level property is present (non-comment). Detects by
- * PRESENCE, not by whether we changed it — a property already at target is
- * `changed:false` yet still declared, and must not trigger a redundant insert.
- * @param {string} text
- * @returns {boolean}
+ * Post-condition WARN: any live `maven.compiler.{source,target,release}` PROPERTY still not
+ * at the target is one we don't own (build props read target by now) — it's stale in a place
+ * we don't rewrite (e.g. cloudHubDeployment <properties>). Surface it; don't touch it.
+ * Property form only (bare inline is handled elsewhere, and a bare <target> is a CloudHub
+ * target name); `${...}` values ride a property bump. Comment-safe.
+ * @returns {string[]}
  */
-function _hasLevelProperty(text) {
-  const tags = [
-    'maven.compiler.source', 'maven.compiler.target', 'maven.compiler.release',
-    'java.version', 'jdk.version', 'javaVersion',
-  ];
-  const comments = _commentRanges(text);
-  for (const t of tags) {
-    for (const m of text.matchAll(new RegExp(`<${_escapeRegExp(t)}>`, 'g'))) {
-      if (!_inComment(m.index, comments)) return true;
+function _staleCompilerLevelWarns(text, targetJava) {
+  const warns = [];
+  const cr = _commentRanges(text);
+  for (const m of text.matchAll(/<(maven\.compiler\.(?:source|target|release))>([^<]*)<\/\1>/g)) {
+    if (_inComment(m.index, cr)) continue;
+    const val = m[2].trim();
+    if (val && !val.startsWith('${') && val !== targetJava) {
+      warns.push(`WARN: ${m[1]}=${val} left unchanged — not the build compiler level this script owns (e.g. inside a plugin/deployment <properties> like cloudHubDeployment); review whether it should target Java ${targetJava}`);
     }
   }
-  return false;
+  return warns;
+}
+
+/**
+ * WARN when maven-toolchains-plugin pins a `<jdk><version>` that isn't the target Java.
+ * The toolchain picks the JDK regardless of JAVA_HOME, so a stale pin compiles on the old
+ * JDK silently. Not rewritten (version/vendor is environment-specific). Comment-safe.
+ * @returns {string[]}
+ */
+function _toolchainJdkWarns(text, targetJava) {
+  const warns = [];
+  for (const b of _findPluginBlocks(text)) {
+    if (_pluckChild(b.inner, 'artifactId') !== 'maven-toolchains-plugin') continue;
+    const cr = _commentRanges(b.inner);
+    for (const jm of b.inner.matchAll(/<jdk>([\s\S]*?)<\/jdk>/g)) {
+      if (_inComment(jm.index, cr)) continue;
+      const vm = jm[1].match(/<version>([^<]*)<\/version>/);
+      const v = vm ? vm[1].trim() : '';
+      if (v && !v.startsWith('${') && v !== targetJava) {
+        warns.push(`WARN: maven-toolchains-plugin pins <jdk><version>${v}</version> — the build compiles under that JDK regardless of JAVA_HOME; review whether it should be Java ${targetJava}`);
+      }
+    }
+  }
+  return warns;
+}
+
+/**
+ * WARN when maven-enforcer-plugin declares a live `<requireJavaVersion>` — its range may
+ * reject the target JDK. Parsing ranges is error-prone, so flag for the agent to verify
+ * rather than guess. Comment-safe.
+ * @returns {string[]}
+ */
+function _enforcerJavaWarns(text, targetJava) {
+  const warns = [];
+  for (const b of _findPluginBlocks(text)) {
+    if (_pluckChild(b.inner, 'artifactId') !== 'maven-enforcer-plugin') continue;
+    const cr = _commentRanges(b.inner);
+    for (const m of b.inner.matchAll(/<requireJavaVersion>([\s\S]*?)<\/requireJavaVersion>/g)) {
+      if (_inComment(m.index, cr)) continue;
+      const vm = m[1].match(/<version>([^<]*)<\/version>/);
+      const range = vm ? vm[1].trim() : '(unspecified)';
+      warns.push(`WARN: maven-enforcer-plugin <requireJavaVersion>${range}</requireJavaVersion> present — verify its range permits Java ${targetJava} or the enforce check will fail the build`);
+    }
+  }
+  return warns;
+}
+
+/**
+ * Bump the Java compiler level to targetJava in place. Invariant: `release` never
+ * coexists with `source`/`target`, and a lone target/source is completed. Level in
+ * both plugin config and properties collapses to the property home; nothing
+ * declared + Java present inserts release (unless <compilerArgs> sets it → warn).
+ * @returns {{text:string, changes:string[]}}
+ */
+function normalizeCompilerLevel(text, targetJava, hasJavaSources) {
+  const changes = [];
+  let out = text;
+
+  const propRel = _hasBuildProperty(out, 'maven.compiler.release');
+  const propSrc = _hasBuildProperty(out, 'maven.compiler.source');
+  const propTgt = _hasBuildProperty(out, 'maven.compiler.target');
+  const hasProp = propRel || propSrc || propTgt;
+  const hasInline = _bumpInlineCompilerLevels(out, targetJava).present;
+
+  const bumpProps = () => {
+    const bump = (tag) => {
+      const r = _replaceBuildProperty(out, tag, targetJava);
+      out = r.text;
+      if (r.changed) changes.push(`${tag}=${targetJava}`);
+    };
+    if (propRel) {
+      bump('maven.compiler.release');
+      for (const t of ['maven.compiler.source', 'maven.compiler.target']) {
+        if (_hasBuildProperty(out, t)) { out = _removeBuildProperty(out, t); changes.push(`removed ${t} (superseded by release)`); }
+      }
+    } else {
+      for (const t of ['maven.compiler.source', 'maven.compiler.target']) {
+        if (_hasBuildProperty(out, t)) bump(t);
+        else { const ins = insertProperty(out, t, targetJava); if (ins.inserted) { out = ins.text; changes.push(`${t}=${targetJava} (inserted)`); } }
+      }
+    }
+  };
+
+  if (hasInline && hasProp) {
+    // Level declared in two mechanisms — the one shape an in-place bump could leave
+    // as `release` beside `source`/`target`. Collapse into the property home.
+    const s = _stripCompilerPluginLevels(out);
+    out = s.text;
+    changes.push('collapsed inline maven-compiler-plugin level into properties (declared in both)');
+    bumpProps();
+  } else if (hasInline) {
+    const inl = _bumpInlineCompilerLevels(out, targetJava);
+    out = inl.text;
+    changes.push(...inl.changes);
+  } else if (hasProp) {
+    bumpProps();
+  } else if (hasJavaSources) {
+    if (_compilerArgsSetLevel(out)) {
+      changes.push(`WARN: compiler level set via <compilerArgs> (-source/--release) — not auto-bumped; verify it targets Java ${targetJava}`);
+    } else {
+      const ins = insertProperty(out, 'maven.compiler.release', targetJava);
+      if (ins.inserted) { out = ins.text; changes.push(`maven.compiler.release=${targetJava} (inserted)`); }
+    }
+  }
+
+  if (_hasTestCompileLevel(out)) {
+    changes.push(`WARN: test-compile level (testSource/testTarget/testRelease) present — not auto-bumped; verify it targets Java ${targetJava}`);
+  }
+
+  // Post-condition: any maven.compiler.* still not at target is one we don't own
+  // (plugin/deployment <properties>, etc.) — surface it, don't rewrite it.
+  changes.push(..._staleCompilerLevelWarns(out, targetJava));
+
+  return { text: out, changes };
 }
 
 // ---------- Runtime + Java bump (edit_pom + edit_mule_artifact) ----------
@@ -218,13 +522,10 @@ export function editPomRuntime(pomPath, targetMule, targetJava, muleMavenPlugin,
   const changes = [];
 
   // Java-related tags: bumped in place only if present, never inserted when
-  // absent (a POM that doesn't declare them shouldn't sprout new ones). The one
-  // exception is the maven.compiler.release insert below, gated on custom Java.
+  // absent. The maven.compiler.* level is owned by normalizeCompilerLevel below
+  // (which handles inline plugin config + insert), so it's not in this loop.
   const tags = [
     ['javaVersion', targetJava],
-    ['maven.compiler.source', targetJava],
-    ['maven.compiler.target', targetJava],
-    ['maven.compiler.release', targetJava],
     ['java.version', targetJava],
     ['jdk.version', targetJava],
   ];
@@ -285,23 +586,22 @@ export function editPomRuntime(pomPath, targetMule, targetJava, muleMavenPlugin,
     });
   }
 
-  // Compiler level: with none declared, javac uses an ancient default that
-  // JDK >= 9 rejects ("Source option 5 is no longer supported"), failing the
-  // build. Only matters when there's Java to compile. So if custom Java exists
-  // and no level is declared here (property or plugin config), insert the target.
-  // A declared level is left alone (property form already bumped in place above).
+  // Normalize the compiler level (properties + inline plugin config) to targetJava
+  // in one non-conflicting home. Insert only matters when Java is compiled — a
+  // missing level makes javac fall back to a default newer JDKs reject.
   const projectDir = path.dirname(pomPath);
   const hasJavaSources =
     _hasJavaFiles(path.join(projectDir, 'src/main/java')) ||
     _hasJavaFiles(path.join(projectDir, 'src/test/java'));
-  const compilerLevelDeclared = _hasLevelProperty(text) || _compilerPluginHasLevel(text);
-  if (hasJavaSources && !compilerLevelDeclared) {
-    const ins = insertProperty(text, 'maven.compiler.release', targetJava);
-    if (ins.inserted) {
-      text = ins.text;
-      changes.push(`maven.compiler.release=${targetJava} (inserted — custom Java, no compiler level declared)`);
-    }
-  }
+  // Always propagate lvl.changes — a warn-only outcome (compilerArgs/test level)
+  // records a message without mutating text and must still surface.
+  const lvl = normalizeCompilerLevel(text, targetJava, hasJavaSources);
+  text = lvl.text;
+  changes.push(...lvl.changes);
+
+  // JDK-selection gating we don't rewrite — surface as WARNs (toolchains pin, enforcer range).
+  changes.push(..._toolchainJdkWarns(text, targetJava));
+  changes.push(..._enforcerJavaWarns(text, targetJava));
 
   if (text !== original) {
     _write(pomPath, text);
