@@ -57,12 +57,10 @@ const MMP_ARTIFACT_ID = "mule-maven-plugin";
 // Lowest MMP major that runs on the required Maven 3.9.x line. MMP 3.x was built
 // against Maven 3.8's Eclipse Aether; Maven 3.9 replaced it with Maven Resolver,
 // so MMP < 4 crashes on 3.9.x (NoClassDefFoundError: …BasicRepositoryConnectorFactory).
-// Fixed compatibility boundary, NOT a target version. This is a permanent fact
-// about MMP majors — 4.x is the first line with Maven Resolver support — so it
-// deliberately does NOT track ACB's shipped version: an app already on MMP >= 4
-// runs on Maven 3.9.x whether ACB currently ships 4.10.x or a later 5.x, and so
-// never needs a baseline bump. Only the bump *target* (latest 4.x) tracks the
-// ecosystem, and that is resolved live in Step 3c — not here.
+// Fixed compatibility boundary, NOT a target version (latest 4.x is resolved live
+// in Step 3c). ACB ships MMP 4.10.0 and auto-bumps 3.x projects to it on first open.
+// TODO: boundary is hardcoded — make deterministic (derive from ACB/tooling
+// metadata) if it ever needs to track ACB's version precisely.
 const MMP_MIN_MAJOR_FOR_MAVEN_39 = 4;
 
 // --- helpers ---------------------------------------------------------------
