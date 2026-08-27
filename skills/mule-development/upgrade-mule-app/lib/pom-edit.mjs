@@ -119,9 +119,13 @@ export function insertProperty(text, tag, value) {
   // <properties> (e.g. mule-maven-plugin > cloudHubDeployment > <properties>),
   // which holds deployment key/values, not project properties.
   const pluginProps = _pluginPropertiesRanges(text);
+  const comments = _commentRanges(text);
   let m = null;
   for (const mm of text.matchAll(/(<properties>)([\s\S]*?)(<\/properties>)/g)) {
-    if (!_inComment(mm.index, pluginProps)) { m = mm; break; }
+    // Skip plugin/deployment props AND commented-out blocks — inserting into a
+    // commented <properties> would silently ship an un-upgraded POM.
+    if (_inComment(mm.index, pluginProps) || _inComment(mm.index, comments)) continue;
+    m = mm; break;
   }
   if (!m) {
     // No <properties> block — create one (after </modelVersion>, else after the
