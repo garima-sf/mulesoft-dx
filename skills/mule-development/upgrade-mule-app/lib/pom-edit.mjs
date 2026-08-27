@@ -469,7 +469,12 @@ function normalizeCompilerLevel(text, targetJava, hasJavaSources) {
     }
   };
 
-  if (hasInline && hasProp) {
+  if (_compilerArgsSetLevel(out)) {
+    // Fronts every branch: if <compilerArgs> sets the level, bumping a coexisting
+    // property/inline level would make javac reject the build (release vs source/target).
+    // Leave it and WARN for manual reconciliation.
+    changes.push(`WARN: compiler level set via <compilerArgs> (-source/-target/--release) — not auto-bumped; any declared maven.compiler.* / inline level left unchanged to avoid a -source/-target vs --release conflict; verify it targets Java ${targetJava}`);
+  } else if (hasInline && hasProp) {
     // Level declared in two mechanisms — the one shape an in-place bump could leave
     // as `release` beside `source`/`target`. Collapse into the property home.
     const s = _stripCompilerPluginLevels(out);
@@ -483,12 +488,8 @@ function normalizeCompilerLevel(text, targetJava, hasJavaSources) {
   } else if (hasProp) {
     bumpProps();
   } else if (hasJavaSources) {
-    if (_compilerArgsSetLevel(out)) {
-      changes.push(`WARN: compiler level set via <compilerArgs> (-source/--release) — not auto-bumped; verify it targets Java ${targetJava}`);
-    } else {
-      const ins = insertProperty(out, 'maven.compiler.release', targetJava);
-      if (ins.inserted) { out = ins.text; changes.push(`maven.compiler.release=${targetJava} (inserted)`); }
-    }
+    const ins = insertProperty(out, 'maven.compiler.release', targetJava);
+    if (ins.inserted) { out = ins.text; changes.push(`maven.compiler.release=${targetJava} (inserted)`); }
   }
 
   if (_hasTestCompileLevel(out)) {
